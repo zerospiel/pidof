@@ -1,3 +1,3 @@
-module github.com/zerospiel/macos-pidof
+module github.com/zerospiel/pidof
 
 go 1.26.1

@@ -4,7 +4,7 @@ package main
 import (
 	"os"
 
-	"github.com/zerospiel/macos-pidof/internal/pidof"
+	"github.com/zerospiel/pidof/internal/pidof"
 )
 
 func main() {

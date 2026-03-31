@@ -1,6 +1,6 @@
-# macos-pidof
+# pidof
 
-A small cross-UNIX `pidof`-like CLI for Linux and macOS.
+A small cross-UNIX `pidof`-like CLI for UNIX (mostly macOS).
 
 It prints matching process IDs separated by spaces and exits with code `1` when no process matches.
 
@@ -8,7 +8,7 @@ It prints matching process IDs separated by spaces and exits with code `1` when 
 
 ```bash
 pidof <name> [name ...]
-pidof --version
+pidof --help
 ```
 
 Examples:

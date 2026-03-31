@@ -15,8 +15,8 @@ builds:
     ldflags:
       - >-
         -s -w
-        -X github.com/zerospiel/macos-pidof/internal/pidof.version={{ if .Env.VERSION }}{{ .Env.VERSION }}{{ else }}{{ .Version }}{{ end }}
-        -X github.com/zerospiel/macos-pidof/internal/pidof.buildTime={{ if .Env.BUILD_TIME }}{{ .Env.BUILD_TIME }}{{ else }}{{ .Date }}{{ end }}
+        -X github.com/zerospiel/pidof/internal/pidof.version={{ if .Env.VERSION }}{{ .Env.VERSION }}{{ else }}{{ .Version }}{{ end }}
+        -X github.com/zerospiel/pidof/internal/pidof.buildTime={{ if .Env.BUILD_TIME }}{{ .Env.BUILD_TIME }}{{ else }}{{ .Date }}{{ end }}
     env:
       - CGO_ENABLED=0
     goos:
@@ -82,27 +82,24 @@ snapshot:
 release:
   github:
     owner: zerospiel
-    name: macos-pidof
+    name: pidof
   name_template: "{{ .ProjectName }} {{ .Tag }}"
   draft: false
   prerelease: auto
   mode: replace
   header: |
-    ## macos-pidof {{ .Tag }}
+    ## pidof {{ .Tag }}
 
-    TODO:
-    ---
-  footer: |
-    ---
     ## Homebrew
 
     Install:
 
     brew install zerospiel/tools/pidof
 
-    Thanks for using macos-pidof.
+    Thanks for using pidof.
+  footer: |
     ---
-    **Full Changelog**: https://github.com/zerospiel/macos-pidof/compare/{{ .PreviousTag }}...{{ .Tag }}
+    **Full Changelog**: https://github.com/zerospiel/pidof/compare/{{ .PreviousTag }}...{{ .Tag }}
 
 brews:
   - name: pidof
@@ -114,7 +111,7 @@ brews:
       name: homebrew-tools
       branch: master
       token: "{{ .Env.GITHUB_TOKEN }}"
-    homepage: https://github.com/zerospiel/macos-pidof
+    homepage: https://github.com/zerospiel/pidof
     commit_author:
       name: goreleaserbot
       email: bot@goreleaser.com
