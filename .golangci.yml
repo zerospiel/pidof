@@ -1,0 +1,47 @@
+version: "2"
+
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+  allow-parallel-runners: true
+
+linters:
+  default: none
+  enable:
+    - errcheck
+    - govet
+    - revive
+    - staticcheck
+    - unused
+
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+  settings:
+    gci:
+      sections:
+        - standard # Standard section: captures all standard packages.
+        - default # Default section: contains all imports that could not be matched to another section type.
+        - prefix(github.com/zerospiel/macos-pidof) # Custom section: groups all imports with the specified Prefix.
+    gofmt:
+      rewrite-rules:
+        - pattern: interface{}
+          replacement: any
+    gofumpt:
+      extra-rules: true
+  exclusions:
+    generated: strict
+
+output:
+  sort-order:
+    - linter
+    - severity
+    - file # filepath, line, and column.
+
+severity:
+  default: "@linter"
+issues:
+  max-same-issues: 10
