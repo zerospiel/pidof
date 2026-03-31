@@ -36,7 +36,7 @@ Test:
 make test
 ```
 
-Validate release config locally:
+Validate release locally:
 
 ```bash
 make validate

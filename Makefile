@@ -2,21 +2,9 @@ BINARY ?= pidof
 
 LOCALBIN ?= $(shell pwd)/bin
 
-GOLANGCI_LINT_VERSION ?= v2.11.4
-GORELEASER_VERSION ?= v2.15.0
-
-GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
-GORELEASER ?= $(LOCALBIN)/goreleaser
-GOLANGCI_LINT_PINNED ?= $(GOLANGCI_LINT)-$(GOLANGCI_LINT_VERSION)
-GORELEASER_PINNED ?= $(GORELEASER)-$(GORELEASER_VERSION)
-
-VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-BUILD_TIME ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
-
-.PHONY: help tools fmt vet lint test tidy build release-check release-build validate
-
 ##@ General
 
+.PHONY: help
 help: ## Display this help.
 	@awk 'BEGIN {FS = ":.*##"; printf "\nUsage:\n  make \033[36m<target>\033[0m\n"} /^[a-zA-Z_0-9-]+:.*?##/ { printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2 } /^##@/ { printf "\n\033[1m%s\033[0m\n", substr($$0, 5) } ' $(MAKEFILE_LIST)
 
@@ -25,61 +13,76 @@ help: ## Display this help.
 $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
 
-$(GOLANGCI_LINT_PINNED): | $(LOCALBIN)
-	$(call go-install-tool,$(GOLANGCI_LINT_PINNED),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION),golangci-lint)
+GOLANGCI_LINT_VERSION ?= v2.11.4
+GORELEASER_VERSION ?= v2.15.0
+GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
+GORELEASER ?= $(LOCALBIN)/goreleaser
+GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
 
-$(GOLANGCI_LINT): $(GOLANGCI_LINT_PINNED)
-	ln -sf "$(GOLANGCI_LINT_PINNED)" "$(GOLANGCI_LINT)"
+.PHONY: golangci-lint
+golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
+$(GOLANGCI_LINT): $(LOCALBIN)
+	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION),golangci-lint)
 
-$(GORELEASER_PINNED): | $(LOCALBIN)
-	$(call go-install-tool,$(GORELEASER_PINNED),github.com/goreleaser/goreleaser/v2,$(GORELEASER_VERSION),goreleaser)
+.PHONY: goreleaser
+goreleaser: $(GORELEASER) ## Download goreleaser locally if necessary.
+$(GORELEASER): $(LOCALBIN)
+	$(call go-install-tool,$(GORELEASER),github.com/goreleaser/goreleaser/v2,$(GORELEASER_VERSION),goreleaser)
 
-$(GORELEASER): $(GORELEASER_PINNED)
-	ln -sf "$(GORELEASER_PINNED)" "$(GORELEASER)"
-
+.PHONY: tools
 tools: $(GOLANGCI_LINT) $(GORELEASER) ## Install pinned local tooling binaries.
 
 ##@ Quality
 
+.PHONY: fmt
 fmt: ## Run go fmt across all packages.
 	go fmt ./...
 
+.PHONY: vet
 vet: ## Run go vet across all packages.
 	go vet ./...
 
+.PHONY: lint
 lint: $(GOLANGCI_LINT) ## Run golangci-lint checks.
-	$(GOLANGCI_LINT) run ./...
+	$(GOLANGCI_LINT) run --config=.golangci.yml --timeout 2m ./...
 
+.PHONY: test
 test: ## Run unit tests with coverage output.
 	go test -coverprofile=coverage.out ./...
 
+.PHONY: tidy
 tidy: ## Tidy and sync Go module files.
 	go mod tidy
 
 ##@ Build & Release
 
+.PHONY: build
 build: $(GORELEASER) | $(LOCALBIN) ## Build local target binary via GoReleaser snapshot.
-	VERSION=$(VERSION) BUILD_TIME=$(BUILD_TIME) $(GORELEASER) build --clean --snapshot --single-target --id pidof --output $(LOCALBIN)/$(BINARY)
+	$(GORELEASER) build --clean --snapshot --single-target --id pidof --output $(LOCALBIN)/$(BINARY)
 
+.PHONY: release-check
 release-check: $(GORELEASER) ## Validate GoReleaser configuration.
 	$(GORELEASER) check
 
-release-build: $(GORELEASER) ## Build all snapshot artifacts via GoReleaser.
-	VERSION=$(VERSION) BUILD_TIME=$(BUILD_TIME) $(GORELEASER) build --snapshot --clean
+.PHONY: release-build
+release-build: $(GORELEASER) release-check ## Build all snapshot artifacts via GoReleaser.
+	$(GORELEASER) build --snapshot --clean
 
-validate: release-check release-build ## Run GoReleaser check and snapshot build.
+.PHONY: validate
+validate: release-build ## Run GoReleaser check and snapshot build.
 
-# go-install-tool installs a tool binary at a pinned version path.
-# $1: target path with binary name and version suffix
-# $2: package to go install
-# $3: package version
-# $4: installed binary name
+# go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
+# $1 - target path with name of binary
+# $2 - package url which can be installed
+# $3 - specific version of package
 define go-install-tool
-@set -e; \
-if [ ! -f "$(1)" ]; then \
-	package="$(2)@$(3)"; \
-	echo "Downloading $${package}"; \
-	GOBIN="$(LOCALBIN)" go install "$${package}"; \
-	mv "$(LOCALBIN)/$(4)" "$(1)"; \
-fi
+@[ -f "$(1)-$(3)" ] && [ "$$(readlink -- "$(1)" 2>/dev/null)" = "$(1)-$(3)" ] || { \
+set -e; \
+package=$(2)@$(3) ;\
+echo "Downloading $${package}" ;\
+rm -f "$(1)" ;\
+GOBIN="$(LOCALBIN)" go install $${package} ;\
+mv "$(LOCALBIN)/$$(basename "$(1)")" "$(1)-$(3)" ;\
+} ;\
+ln -sf "$$(realpath "$(1)-$(3)")" "$(1)"
 endef
