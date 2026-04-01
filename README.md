@@ -3,9 +3,9 @@
 [![Codecov](https://codecov.io/gh/zerospiel/pidof/graph/badge.svg)](https://codecov.io/gh/zerospiel/pidof)
 [![CI](https://github.com/zerospiel/pidof/actions/workflows/ci.yml/badge.svg)](https://github.com/zerospiel/pidof/actions/workflows/ci.yml)
 
-A small cross-UNIX `pidof`-like CLI for UNIX (mostly macOS).
+Display the PID number for a given process name(s).
 
-It prints matching process IDs separated by spaces and exits with code `1` when no process matches.
+Drop-in replacement for the deprecated and removed [NightProductions CLI](https://web.archive.org/web/20240808152721/http://www.nightproductions.net/cli.htm).
 
 ## Usage
 

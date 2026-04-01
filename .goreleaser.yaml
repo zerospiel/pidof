@@ -47,33 +47,20 @@ checksum:
 changelog:
   sort: asc
   use: github
-  format: "{{ .SHA }}: {{ .Message }}{{ with .AuthorUsername }} by @{{ . }}{{ end }}"
   filters:
     exclude:
-      - "^test:"
-      - "^test\\("
-      - "^(build|ci): "
-      - "^ci\\("
-      - "^chore:"
-      - "^chore\\("
       - "merge conflict"
       - Merge pull request
       - Merge remote-tracking branch
       - Merge branch
   groups:
-    - title: "🚀 New Features 🚀"
+    - title: "Features"
       regexp: '^.*?(feat)(\([[:word:]]+\))??!?:.+$'
       order: 100
-    - title: "🔐 Security updates 🔐"
-      regexp: '^.*?sec(\([[:word:]]+\))??!?:.+$'
-      order: 150
-    - title: "🐛 Notable Fixes 🐛"
+    - title: "Bug Fixes"
       regexp: '^.*?fix(\([[:word:]]+\))??!?:.+$'
       order: 200
-    - title: "📄 Documentation updates 📄"
-      regexp: ^.*?docs?(\([[:word:]]+\))??!?:.+$
-      order: 300
-    - title: "✨ Notable Changes ✨"
+    - title: "Others"
       order: 9999
 
 snapshot:
@@ -83,21 +70,19 @@ release:
   github:
     owner: zerospiel
     name: pidof
-  name_template: "{{ .ProjectName }} {{ .Tag }}"
   draft: false
   prerelease: auto
   mode: replace
   header: |
     ## pidof {{ .Tag }}
 
+  footer: |
+    ---
     ## Homebrew
 
     Install:
 
-    brew install zerospiel/tools/pidof
-
-    Thanks for using pidof.
-  footer: |
+    `brew install zerospiel/tools/pidof`
     ---
     **Full Changelog**: https://github.com/zerospiel/pidof/compare/{{ .PreviousTag }}...{{ .Tag }}
 
@@ -118,6 +103,6 @@ brews:
     license: "MIT"
     skip_upload: auto
     commit_msg_template: "Brew formula update for {{ .ProjectName }} version {{ .Tag }}"
-    description: A small cross-UNIX pidof-like CLI for UNIX (mostly macOS)
+    description: Display the PID number for a given process name(s). Drop-in replacement for the deprecated NightProductions pidof.
     test: |
       assert_match "pidof", shell_output("#{bin}/pidof --version")
