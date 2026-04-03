@@ -11,6 +11,8 @@ Drop-in replacement for the deprecated and removed [NightProductions CLI](https:
 
 ```bash
 pidof <name> [name ...]
+pidof -l <name>
+pidof -x -o %PPID <script-name>
 pidof --help
 ```
 
@@ -19,6 +21,8 @@ Examples:
 ```bash
 pidof sshd
 pidof bash zsh
+pidof -s bash
+pidof -x my-script.sh
 ```
 
 ## Local development

@@ -14,7 +14,7 @@ $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
 
 GOLANGCI_LINT_VERSION ?= v2.11.4
-GORELEASER_VERSION ?= v2.15.0
+GORELEASER_VERSION ?= v2.15.2
 GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
 GORELEASER ?= $(LOCALBIN)/goreleaser
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
@@ -45,6 +45,10 @@ vet: ## Run go vet across all packages.
 .PHONY: lint
 lint: $(GOLANGCI_LINT) ## Run golangci-lint checks.
 	$(GOLANGCI_LINT) run --config=.golangci.yml --timeout 2m ./...
+
+.PHONY: lint-fix
+lint-fix: $(GOLANGCI_LINT) ## Run golangci-lint checks with fixes detected by the linters.
+	$(GOLANGCI_LINT) run --fix --config=.golangci.yml --timeout 2m ./...
 
 .PHONY: test
 test: ## Run unit tests with coverage output.

@@ -15,8 +15,7 @@ builds:
     ldflags:
       - >-
         -s -w
-        -X github.com/zerospiel/pidof/internal/pidof.version={{ .Version }}
-        -X github.com/zerospiel/pidof/internal/pidof.buildTime={{ .Date }}
+        -X main.version={{ .Version }}
     env:
       - CGO_ENABLED=0
     goos:
