@@ -9,11 +9,14 @@ Drop-in replacement for the deprecated and removed [NightProductions CLI](https:
 
 ## Usage
 
+```text
+pidof [-k] [-l] [-h|-?] [-v] [-s] [-c] [-x] [-q] [-z] [-d sep] [-o omitpid[,omitpid...]] name [name ...]
+```
+
+Help:
+
 ```bash
-pidof <name> [name ...]
-pidof -l <name>
-pidof -x -o %PPID <script-name>
-pidof --help
+pidof -?
 ```
 
 Examples:
