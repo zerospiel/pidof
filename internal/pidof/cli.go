@@ -24,21 +24,21 @@ const (
 	exitUsage        = 2
 )
 
-const usageText = `usage: pidof [-k] [-l] [-h|-?|--help] [-v|--version] [-s] [-c] [-x] [-q] [-z] [-d sep] [-o omitpid[,omitpid...]] name [name ...]
+const usageText = `usage: pidof [-k] [-l] [-h|-?] [-v] [-s] [-c] [-x] [-q] [-z] [-d sep] [-o omitpid[,omitpid...]] name [name ...]
 
-	-k      Kill matching processes
-				(Note: You must have sufficient privileges!)
-	-l      Print long output
-	-h -?   Show help
-	-v      Print version information
+	-k	Kill processes for given pid name
+		  (Note: You must have sufficient privileges!)
+	-l	List long output
+	-h -?	This help screen
+	-v	Print out the version info
 
-	-s      Stop after the first match
-	-c      Same root directory only when supported
-	-x      Include interpreter-run scripts
-	-o pid  Omit one or more PIDs, or %PPID
-	-q      Quiet mode, exit status only
-	-d sep  Use sep between printed PIDs
-	-z      Include zombie and D-state processes
+	-s	Single shot - this instructs the program to only return one pid
+	-c	Only return process ids that are running with the same root directory. This option is ignored for non-root users, as they will be unable to check the current root directory of processes they do not own
+	-x	Scripts too - this causes the program to also return process id's of shells running the named scripts
+	-o pid	Tells pidof to omit processes with that process id. The special pid %PPID can be used to name the parent process of the pidof program, in other words the calling shell or shell script
+	-q	Quiet mode, suppress any output and only sets the exit status accordingly
+	-d sep	Tells pidof to use sep as an output separator if more than one PID is shown. The default separator is a space
+	-z	Include zombie and D-state processes
 `
 
 type killFunc func(int) error
