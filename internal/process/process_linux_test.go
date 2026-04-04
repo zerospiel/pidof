@@ -64,7 +64,7 @@ func Test_linuxDisplayName(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		process Process
+		process processInfo
 		exe     string
 		cmd     cmdlineInfo
 		mode    displayMode
@@ -73,7 +73,7 @@ func Test_linuxDisplayName(t *testing.T) {
 	}{
 		{
 			name:    "prefers script when it matched",
-			process: Process{Name: "python3"},
+			process: processInfo{Name: "python3"},
 			exe:     "/usr/bin/python3",
 			cmd:     cmdlineInfo{argv0: "/usr/bin/python3", script: "/tmp/tool.py"},
 			mode:    longDisplay,
@@ -82,7 +82,7 @@ func Test_linuxDisplayName(t *testing.T) {
 		},
 		{
 			name:    "falls back to process name",
-			process: Process{Name: "bash"},
+			process: processInfo{Name: "bash"},
 			want:    "bash",
 		},
 	}
@@ -104,7 +104,7 @@ func Test_linuxMatch(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		process     Process
+		process     processInfo
 		query       query
 		opt         FindOptions
 		exe         string
@@ -114,7 +114,7 @@ func Test_linuxMatch(t *testing.T) {
 	}{
 		{
 			name:        "script match",
-			process:     Process{Name: "python3"},
+			process:     processInfo{Name: "python3"},
 			query:       query{raw: "tool.py", base: "tool.py"},
 			opt:         FindOptions{ScriptsToo: true},
 			exe:         "/usr/bin/python3",
@@ -124,14 +124,14 @@ func Test_linuxMatch(t *testing.T) {
 		},
 		{
 			name:        "plain process name fast path",
-			process:     Process{Name: "bash"},
+			process:     processInfo{Name: "bash"},
 			query:       query{raw: "bash", base: "bash"},
 			wantMatched: true,
 			wantName:    "bash",
 		},
 		{
 			name:        "matches interpreter executable exactly",
-			process:     Process{Name: "bashlike.sh"},
+			process:     processInfo{Name: "bashlike.sh"},
 			query:       query{raw: "bash", base: "bash"},
 			exe:         "/bin/bash",
 			cmd:         cmdlineInfo{argv0: "/tmp/bashlike.sh"},
@@ -160,24 +160,6 @@ func Test_linuxMatch(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestList(t *testing.T) {
-	t.Parallel()
-
-	processes, err := List(context.Background())
-	if err != nil {
-		t.Fatalf("List() error = %v", err)
-	}
-
-	pid := os.Getpid()
-	for _, process := range processes {
-		if process.PID == pid {
-			return
-		}
-	}
-
-	t.Fatal(errors.New("current pid not found"))
 }
 
 func TestFind(t *testing.T) {

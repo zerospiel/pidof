@@ -20,43 +20,6 @@ type darwinProcArgs struct {
 
 const darwinUserCacheCap = 8
 
-// nativeList returns a full Darwin process snapshot from the kernel process table.
-func nativeList(ctx context.Context) ([]Process, error) {
-	kprocs, err := unix.SysctlKinfoProcSlice("kern.proc.all")
-	if err != nil {
-		return nil, fmt.Errorf("read kern.proc.all: %w", err)
-	}
-
-	processes := make([]Process, 0, len(kprocs))
-	for i := range kprocs {
-		if err := ctx.Err(); err != nil {
-			return nil, fmt.Errorf("list processes: %w", err)
-		}
-
-		kp := &kprocs[i]
-
-		pid := int(kp.Proc.P_pid)
-		if pid <= 0 {
-			continue
-		}
-
-		short := kp.Proc.P_comm[:]
-
-		shortLen := cStringLen(short)
-		if shortLen == 0 {
-			continue
-		}
-
-		processes = append(processes, Process{
-			PID:  pid,
-			PPID: int(kp.Eproc.Ppid),
-			Name: string(short[:shortLen]),
-		})
-	}
-
-	return processes, nil
-}
-
 // nativeFind scans the Darwin kinfo table sequentially because the source data is already
 // in one contiguous kernel buffer, so extra goroutines would mostly add scheduling
 // overhead and reduce cache locality.

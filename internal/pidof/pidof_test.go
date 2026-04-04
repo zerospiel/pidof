@@ -89,7 +89,6 @@ func Test_parseOptions(t *testing.T) {
 				"-c",
 				"-q",
 				"-z",
-				"-n",
 				"-d",
 				",",
 				"-o",
@@ -116,18 +115,8 @@ func Test_parseOptions(t *testing.T) {
 			want: cliOptions{showHelp: true, separator: defaultSeparator, queries: []string{"bash"}},
 		},
 		{
-			name: "long help alias",
-			args: []string{"--help", "bash"},
-			want: cliOptions{showHelp: true, separator: defaultSeparator, queries: []string{"bash"}},
-		},
-		{
 			name: "short version alias",
 			args: []string{"-v", "bash"},
-			want: cliOptions{showVersion: true, separator: defaultSeparator, queries: []string{"bash"}},
-		},
-		{
-			name: "long version alias",
-			args: []string{"--version", "bash"},
 			want: cliOptions{showVersion: true, separator: defaultSeparator, queries: []string{"bash"}},
 		},
 		{
@@ -191,13 +180,13 @@ func Test_run(t *testing.T) {
 	}{
 		{
 			name:             "help",
-			args:             []string{"--help"},
+			args:             []string{"-?"},
 			wantCode:         exitSuccess,
 			wantStderrSubstr: "usage: pidof",
 		},
 		{
 			name:             "version",
-			args:             []string{"--version"},
+			args:             []string{"-v"},
 			versionOverride:  "test-version",
 			wantCode:         exitSuccess,
 			wantStdoutSubstr: "test-version",

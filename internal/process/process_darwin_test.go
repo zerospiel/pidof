@@ -89,24 +89,6 @@ func Test_darwinMatch(t *testing.T) {
 	}
 }
 
-func TestList(t *testing.T) {
-	t.Parallel()
-
-	processes, err := List(context.Background())
-	if err != nil {
-		t.Fatalf("List() error = %v", err)
-	}
-
-	pid := os.Getpid()
-	for _, process := range processes {
-		if process.PID == pid {
-			return
-		}
-	}
-
-	t.Fatal(errors.New("current pid not found"))
-}
-
 func TestFind(t *testing.T) {
 	t.Parallel()
 

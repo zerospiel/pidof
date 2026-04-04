@@ -24,20 +24,21 @@ const (
 	exitUsage        = 2
 )
 
-const usageText = `usage: pidof [-k] [-l] [-h|-?|--help] [-v|--version] [-s] [-c] [-x] [-q] [-n] [-z] [-d sep] [-o omitpid[,omitpid...]] name [name ...]
+const usageText = `usage: pidof [-k] [-l] [-h|-?|--help] [-v|--version] [-s] [-c] [-x] [-q] [-z] [-d sep] [-o omitpid[,omitpid...]] name [name ...]
 
--k      Kill matching processes
--l      Print long output
--h -?   Show help
--v      Print version information
--s      Stop after the first match
--c      Same root directory only when supported
--x      Include interpreter-run scripts
--o pid  Omit one or more PIDs, or %PPID
--q      Quiet mode, exit status only
--d sep  Use sep between printed PIDs
--n      Accepted for compatibility, ignored
--z      Include zombie and D-state processes
+	-k      Kill matching processes
+				(Note: You must have sufficient privileges!)
+	-l      Print long output
+	-h -?   Show help
+	-v      Print version information
+
+	-s      Stop after the first match
+	-c      Same root directory only when supported
+	-x      Include interpreter-run scripts
+	-o pid  Omit one or more PIDs, or %PPID
+	-q      Quiet mode, exit status only
+	-d sep  Use sep between printed PIDs
+	-z      Include zombie and D-state processes
 `
 
 type killFunc func(int) error
@@ -228,14 +229,11 @@ func parseOptions(args []string) (cliOptions, error) {
 	fs.BoolVar(&opts.long, "l", false, "print long output")
 	fs.BoolVar(&opts.showHelp, "h", false, "show help")
 	fs.BoolVar(&opts.showHelp, "?", false, "show help")
-	fs.BoolVar(&opts.showHelp, "help", false, "show help")
 	fs.BoolVar(&opts.showVersion, "v", false, "print version information")
-	fs.BoolVar(&opts.showVersion, "version", false, "print version information")
 	fs.BoolVar(&opts.single, "s", false, "single shot")
 	fs.BoolVar(&opts.sameRoot, "c", false, "same root directory only")
 	fs.BoolVar(&opts.scriptsToo, "x", false, "include scripts")
 	fs.BoolVar(&opts.quiet, "q", false, "quiet mode")
-	fs.BoolFunc("n", "compatibility no-op", func(string) error { return nil })
 	fs.BoolVar(&opts.includeSpecialStates, "z", false, "include zombie and D-state processes")
 	fs.StringVar(&opts.separator, "d", defaultSeparator, "output separator")
 	fs.Func("o", "omit pid", func(value string) error {

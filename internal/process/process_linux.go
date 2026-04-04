@@ -23,7 +23,6 @@ const (
 	linuxCmdlineBufferSize  = 4096
 	linuxReadlinkBufferSize = 4096
 	linuxPIDTextSize        = 20
-	linuxInitialProcessCap  = 256
 	linuxMaxWorkers         = 8
 	linuxMinWorkers         = 2
 	linuxJobQueueFactor     = 2
@@ -37,6 +36,17 @@ const (
 type cmdlineInfo struct {
 	argv0  string
 	script string
+}
+
+// processInfo carries the per-process fields the Linux matcher needs.
+type processInfo struct {
+	Name   string
+	Exe    string
+	Argv0  string
+	Script string
+	PID    int
+	PPID   int
+	State  byte
 }
 
 type matchKind uint8
@@ -68,25 +78,6 @@ type linuxPIDJob struct {
 type linuxMatchChunk struct {
 	matches []Match
 	order   int
-}
-
-// nativeList walks /proc sequentially and materializes a full process snapshot.
-func nativeList(ctx context.Context) ([]Process, error) {
-	processes := make([]Process, 0, linuxInitialProcessCap)
-
-	err := walkLinuxProcDirs(ctx, func(pid, pidDirFD int) (bool, error) {
-		process, err := readLinuxProcessAt(pid, pidDirFD)
-		if err == nil {
-			processes = append(processes, process)
-		}
-
-		return false, nil
-	})
-	if err != nil {
-		return nil, fmt.Errorf("list processes: %w", err)
-	}
-
-	return processes, nil
 }
 
 // nativeFind uses a sequential fast path for single-shot lookups and a bounded worker
@@ -266,7 +257,7 @@ func matchLinuxProcessAt(pid, pidDirFD int, queries []query, opt FindOptions, sa
 		}
 	}
 
-	process := Process{
+	process := processInfo{
 		PID:   pid,
 		PPID:  ppid,
 		State: state,
@@ -330,7 +321,7 @@ func matchLinuxProcessAt(pid, pidDirFD int, queries []query, opt FindOptions, sa
 
 // linuxMatch checks the cheap process name first and only loads exe/cmdline when
 // a query needs more detail.
-func linuxMatch(process Process, query query, opt FindOptions, loadExe func() string, loadCmd func() cmdlineInfo) (bool, string) {
+func linuxMatch(process processInfo, query query, opt FindOptions, loadExe func() string, loadCmd func() cmdlineInfo) (bool, string) {
 	mode := shortDisplay
 	if opt.LongNames {
 		mode = longDisplay
@@ -382,7 +373,7 @@ func linuxMatch(process Process, query query, opt FindOptions, loadExe func() st
 
 // linuxDisplayName chooses the most informative printable name with the data that
 // has already been loaded for the current query.
-func linuxDisplayName(process Process, exe string, cmd cmdlineInfo, mode displayMode, kind matchKind) string {
+func linuxDisplayName(process processInfo, exe string, cmd cmdlineInfo, mode displayMode, kind matchKind) string {
 	if kind == scriptMatch {
 		if script := baseName(cmd.script); script != "" {
 			return script
@@ -494,27 +485,6 @@ func walkLinuxPIDs(ctx context.Context, procRootFD int, yield func(pid int) bool
 			}
 		}
 	}
-}
-
-// readLinuxProcessAt loads the process details used by the snapshot API.
-func readLinuxProcessAt(pid, pidDirFD int) (Process, error) {
-	name, state, ppid, ok := readLinuxStatAt(pidDirFD)
-	if !ok {
-		return Process{}, errors.New("parse stat")
-	}
-
-	exe, _ := readlinkAt(pidDirFD, "exe")
-	cmd, _ := readCmdlineInfoAt(pidDirFD, cmdlineWithScript)
-
-	return Process{
-		PID:    pid,
-		PPID:   ppid,
-		State:  state,
-		Name:   name,
-		Exe:    exe,
-		Argv0:  cmd.argv0,
-		Script: cmd.script,
-	}, nil
 }
 
 // readLinuxStatAt parses /proc/<pid>/stat.
