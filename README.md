@@ -12,8 +12,7 @@ Drop-in replacement for the deprecated and removed [NightProductions CLI](https:
 Homebrew:
 
 ```bash
-brew tap zerospiel/tools
-brew install --cask zerospiel/tools/pidof
+brew install zerospiel/tools/pidof
 ```
 
 Release installer:
@@ -22,12 +21,7 @@ Release installer:
 curl -fsSL https://raw.githubusercontent.com/zerospiel/pidof/master/install.sh | bash
 ```
 
-The installer supports `Darwin` and `Linux` on `amd64` and `arm64`. You can override the target directory or version:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/zerospiel/pidof/master/install.sh | INSTALL_DIR="$HOME/.local/bin" bash
-curl -fsSL https://raw.githubusercontent.com/zerospiel/pidof/master/install.sh | VERSION=v0.1.2 bash
-```
+The installer supports `Darwin` and `Linux` on `amd64` and `arm64`.
 
 Build from source with Go:
 
