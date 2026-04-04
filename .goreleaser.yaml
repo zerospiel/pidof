@@ -104,4 +104,4 @@ brews:
     commit_msg_template: "Brew formula update for {{ .ProjectName }} version {{ .Tag }}"
     description: Display the PID number for a given process name(s)
     test: |
-      assert_match "pidof", shell_output("#{bin}/pidof --version")
+      assert_match "pidof", shell_output("#{bin}/pidof -v")
