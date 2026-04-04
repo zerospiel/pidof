@@ -166,7 +166,6 @@ func Test_parseOptions(t *testing.T) {
 	}
 }
 
-//nolint:paralleltest // The test captures process-global stdout/stderr and is clearer as one table.
 func Test_run(t *testing.T) {
 	tests := []struct {
 		name             string

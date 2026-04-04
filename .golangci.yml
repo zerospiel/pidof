@@ -47,6 +47,8 @@ linters:
         - opaque # Identifies functions that return interfaces, but the actual returned value is always a single concrete implementation.
     govet:
       enable-all: true
+    paralleltest:
+      ignore-missing: true
     prealloc:
       for-loops: true
     revive:

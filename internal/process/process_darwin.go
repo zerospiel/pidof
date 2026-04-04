@@ -167,21 +167,8 @@ func readDarwinProcArgs(pid int) darwinProcArgs {
 		argv0: string(argv0),
 	}
 
-	for argc--; argc > 0; argc-- {
-		field, next, ok := nextNULField(rest)
-		if !ok {
-			break
-		}
-
-		rest = next
-
-		if len(field) == 0 || field[0] == '-' {
-			continue
-		}
-
-		procArgs.script = string(field)
-
-		break
+	if argc > 1 {
+		procArgs.script = firstScriptArgN(procArgs.argv0, rest, argc-1)
 	}
 
 	return procArgs

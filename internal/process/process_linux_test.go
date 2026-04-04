@@ -6,7 +6,10 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
+	"runtime"
 	"testing"
+	"time"
 )
 
 func Test_parseProcStat(t *testing.T) {
@@ -174,5 +177,70 @@ func TestFind(t *testing.T) {
 
 	if len(matches) == 0 {
 		t.Fatal(errors.New("current process query returned no matches"))
+	}
+}
+
+func TestFind_manyMatchesDoesNotDeadlock(t *testing.T) {
+	oldProcs := runtime.GOMAXPROCS(2)
+	defer runtime.GOMAXPROCS(oldProcs)
+
+	const (
+		matchCount    = linuxMaxWorkers + 2
+		followerCount = linuxMaxWorkers + linuxJobQueueFactor
+	)
+
+	children := make([]*exec.Cmd, 0, matchCount+followerCount)
+	for range matchCount {
+		cmd := exec.CommandContext(t.Context(), "sleep", "10")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("sleep start error = %v", err)
+		}
+
+		children = append(children, cmd)
+	}
+
+	for range followerCount {
+		cmd := exec.CommandContext(t.Context(), "tail", "-f", "/dev/null")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("tail start error = %v", err)
+		}
+
+		children = append(children, cmd)
+	}
+
+	t.Cleanup(func() {
+		for _, child := range children {
+			if child.Process == nil {
+				continue
+			}
+
+			_ = child.Process.Kill()
+			_ = child.Wait()
+		}
+	})
+
+	type result struct {
+		matches []Match
+		err     error
+	}
+
+	done := make(chan result, 1)
+
+	go func() {
+		matches, err := Find(context.Background(), []string{"sleep"}, FindOptions{})
+		done <- result{matches: matches, err: err}
+	}()
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Find() error = %v", got.err)
+		}
+
+		if len(got.matches) < matchCount {
+			t.Fatalf("len(matches) = %d, want at least %d", len(got.matches), matchCount)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Find() timed out with many matching processes")
 	}
 }

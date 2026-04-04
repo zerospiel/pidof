@@ -166,3 +166,122 @@ func Test_samePath(t *testing.T) {
 		})
 	}
 }
+
+func Test_firstScriptArg(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		argv0 string
+		rest  []string
+		want  string
+	}{
+		{
+			name:  "shell script path",
+			argv0: "/bin/sh",
+			rest:  []string{"./tool.sh", "--verbose"},
+			want:  "./tool.sh",
+		},
+		{
+			name:  "shell command string is not a script",
+			argv0: "/bin/bash",
+			rest:  []string{"-c", "echo ready; sleep 20", "shell-name"},
+			want:  "",
+		},
+		{
+			name:  "shell grouped command option is not a script",
+			argv0: "/bin/sh",
+			rest:  []string{"-xc", "echo ready; sleep 20"},
+			want:  "",
+		},
+		{
+			name:  "python module mode is not a script",
+			argv0: "/usr/bin/python3",
+			rest:  []string{"-m", "http.server", "8000"},
+			want:  "",
+		},
+		{
+			name:  "python grouped module option is not a script",
+			argv0: "python3",
+			rest:  []string{"-Im", "http.server"},
+			want:  "",
+		},
+		{
+			name:  "python script path",
+			argv0: "python3",
+			rest:  []string{"tool.py", "--port", "8000"},
+			want:  "tool.py",
+		},
+		{
+			name:  "double dash allows dashed script names",
+			argv0: "/bin/sh",
+			rest:  []string{"--", "-tool.sh"},
+			want:  "-tool.sh",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := firstScriptArg(test.argv0, joinNULFields(test.rest...)); got != test.want {
+				t.Fatalf("firstScriptArg(%q, %v) = %q, want %q", test.argv0, test.rest, got, test.want)
+			}
+		})
+	}
+}
+
+func Test_firstScriptArgN(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		argv0     string
+		rest      []string
+		maxFields int
+		want      string
+	}{
+		{
+			name:      "stops before environment after option only argv",
+			argv0:     "/bin/bash",
+			rest:      []string{"-l", "HOME=/tmp/demo"},
+			maxFields: 1,
+			want:      "",
+		},
+		{
+			name:      "still finds script within bounded argv",
+			argv0:     "/usr/bin/python3",
+			rest:      []string{"-I", "tool.py", "HOME=/tmp/demo"},
+			maxFields: 2,
+			want:      "tool.py",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := firstScriptArgN(test.argv0, joinNULFields(test.rest...), test.maxFields); got != test.want {
+				t.Fatalf(
+					"firstScriptArgN(%q, %v, %d) = %q, want %q",
+					test.argv0,
+					test.rest,
+					test.maxFields,
+					got,
+					test.want,
+				)
+			}
+		})
+	}
+}
+
+func joinNULFields(fields ...string) []byte {
+	var joined []byte
+
+	for _, field := range fields {
+		joined = append(joined, field...)
+		joined = append(joined, 0)
+	}
+
+	return joined
+}

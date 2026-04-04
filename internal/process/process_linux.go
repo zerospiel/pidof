@@ -168,6 +168,15 @@ func findLinuxParallel(ctx context.Context, queries []query, opt FindOptions, sa
 		})
 	}
 
+	orderedChunks := make(map[int][]Match, initialMatchCapacity)
+
+	var collectors sync.WaitGroup
+	collectors.Go(func() {
+		for chunk := range results {
+			orderedChunks[chunk.order] = chunk.matches
+		}
+	})
+
 	stoppedByContext := false
 	jobCount := 0
 	produceErr := walkLinuxPIDs(ctx, procRootFD, func(pid int) bool {
@@ -191,6 +200,7 @@ func findLinuxParallel(ctx context.Context, queries []query, opt FindOptions, sa
 	close(jobs)
 	workers.Wait()
 	close(results)
+	collectors.Wait()
 
 	if produceErr == nil && stoppedByContext {
 		produceErr = ctx.Err()
@@ -200,14 +210,9 @@ func findLinuxParallel(ctx context.Context, queries []query, opt FindOptions, sa
 		return nil, fmt.Errorf("scan /proc: %w", produceErr)
 	}
 
-	orderedChunks := make([][]Match, jobCount)
-	for chunk := range results {
-		orderedChunks[chunk.order] = chunk.matches
-	}
-
 	matches := make([]Match, 0, initialMatchCapacity)
-	for _, chunk := range orderedChunks {
-		matches = append(matches, chunk...)
+	for order := range jobCount {
+		matches = append(matches, orderedChunks[order]...)
 	}
 
 	return matches, nil
@@ -264,11 +269,11 @@ func matchLinuxProcessAt(pid, pidDirFD int, queries []query, opt FindOptions, sa
 		Name:  name,
 	}
 
-	// exe and cmdline reads are relatively expensive, so keep them lazy and shared
-	// across all query checks for this pid.
-	var exe string
-
-	var exeLoaded bool
+	var (
+		// exe and cmdline reads are relatively expensive, so keep them lazy and shared across all query checks for this pid.
+		exe       string
+		exeLoaded bool
+	)
 
 	loadExe := func() string {
 		if exeLoaded {
@@ -281,9 +286,10 @@ func matchLinuxProcessAt(pid, pidDirFD int, queries []query, opt FindOptions, sa
 		return exe
 	}
 
-	var cmd cmdlineInfo
-
-	var cmdLoaded bool
+	var (
+		cmd       cmdlineInfo
+		cmdLoaded bool
+	)
 
 	cmdMode := cmdlineArgv0Only
 	if opt.ScriptsToo {
@@ -541,22 +547,9 @@ func readCmdlineInfoAt(dirFD int, mode cmdlineReadMode) (cmdlineInfo, error) {
 		return cmd, nil
 	}
 
-	for {
-		field, next, ok := nextNULField(rest)
-		if !ok {
-			return cmd, nil
-		}
+	cmd.script = firstScriptArg(cmd.argv0, rest)
 
-		rest = next
-
-		if len(field) == 0 || field[0] == '-' {
-			continue
-		}
-
-		cmd.script = string(field)
-
-		return cmd, nil
-	}
+	return cmd, nil
 }
 
 // readlinkAt reads a procfs symlink into a stack-backed buffer.

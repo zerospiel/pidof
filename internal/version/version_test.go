@@ -4,7 +4,6 @@ import (
 	"testing"
 )
 
-//nolint:paralleltest // The test mutates the package-global VersionOverride.
 func TestPathVersion(t *testing.T) {
 	tests := []struct {
 		name           string
