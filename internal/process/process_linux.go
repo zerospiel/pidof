@@ -23,8 +23,15 @@ const (
 	linuxCmdlineBufferSize  = 4096
 	linuxReadlinkBufferSize = 4096
 	linuxPIDTextSize        = 20
+	linuxInitialProcessCap  = 256
 	linuxMaxWorkers         = 8
+	linuxMinWorkers         = 2
 	linuxJobQueueFactor     = 2
+	linuxWorkerMatchCap     = 8
+	linuxPerProcessMatchCap = 2
+	linuxDecimalBase        = 10
+	procStatStateOffset     = 2
+	procStatPPIDOffset      = 2
 )
 
 type cmdlineInfo struct {
@@ -32,17 +39,47 @@ type cmdlineInfo struct {
 	script string
 }
 
+type matchKind uint8
+
+const (
+	regularMatch matchKind = iota
+	scriptMatch
+)
+
+type displayMode uint8
+
+const (
+	shortDisplay displayMode = iota
+	longDisplay
+)
+
+type cmdlineReadMode uint8
+
+const (
+	cmdlineArgv0Only cmdlineReadMode = iota
+	cmdlineWithScript
+)
+
+type linuxPIDJob struct {
+	pid   int
+	order int
+}
+
+type linuxMatchChunk struct {
+	matches []Match
+	order   int
+}
+
 // nativeList walks /proc sequentially and materializes a full process snapshot.
 func nativeList(ctx context.Context) ([]Process, error) {
-	processes := make([]Process, 0, 256)
+	processes := make([]Process, 0, linuxInitialProcessCap)
 
 	err := walkLinuxProcDirs(ctx, func(pid, pidDirFD int) (bool, error) {
 		process, err := readLinuxProcessAt(pid, pidDirFD)
-		if err != nil {
-			return false, nil
+		if err == nil {
+			processes = append(processes, process)
 		}
 
-		processes = append(processes, process)
 		return false, nil
 	})
 	if err != nil {
@@ -60,7 +97,10 @@ func nativeFind(ctx context.Context, names []string, opt FindOptions) ([]Match, 
 		return nil, nil
 	}
 
-	sameRoot := linuxSameRoot(opt.SameRoot)
+	sameRoot := ""
+	if opt.SameRoot {
+		sameRoot = linuxSameRoot()
+	}
 
 	if opt.Single || runtime.GOMAXPROCS(0) == 1 {
 		return findLinuxSequential(ctx, queries, opt, sameRoot)
@@ -72,8 +112,8 @@ func nativeFind(ctx context.Context, names []string, opt FindOptions) ([]Match, 
 // linuxSameRoot resolves the caller root path only when -c is both requested and
 // meaningful. This matches pidof's root-only behavior without penalizing the
 // common case.
-func linuxSameRoot(enabled bool) string {
-	if !enabled || os.Geteuid() != 0 {
+func linuxSameRoot() string {
+	if os.Geteuid() != 0 {
 		return ""
 	}
 
@@ -85,73 +125,74 @@ func linuxSameRoot(enabled bool) string {
 	return root
 }
 
-// findLinuxSequential keeps deterministic traversal order and avoids extra
+// findLinuxSequential keeps procfs encounter order intact and avoids extra
 // goroutine setup for single-shot queries.
 func findLinuxSequential(ctx context.Context, queries []query, opt FindOptions, sameRoot string) ([]Match, error) {
 	matches := make([]Match, 0, initialMatchCapacity)
 
 	err := walkLinuxProcDirs(ctx, func(pid, pidDirFD int) (bool, error) {
 		processMatches, err := matchLinuxProcessAt(pid, pidDirFD, queries, opt, sameRoot)
-		if err != nil {
-			return false, nil
-		}
-		if len(processMatches) == 0 {
-			return false, nil
+		if err == nil && len(processMatches) > 0 {
+			matches = append(matches, processMatches...)
+
+			return opt.Single, nil
 		}
 
-		matches = append(matches, processMatches...)
-		return opt.Single, nil
+		return false, nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("scan /proc: %w", err)
 	}
 
-	sortMatches(matches)
 	return matches, nil
 }
 
-// findLinuxParallel overlaps per-PID /proc reads with a small worker pool. The
-// worker count is capped to avoid turning the scan into FD or scheduler churn.
+// findLinuxParallel overlaps per-PID /proc reads with a small worker pool while
+// restoring procfs encounter order after the parallel scan completes.
 func findLinuxParallel(ctx context.Context, queries []query, opt FindOptions, sameRoot string) ([]Match, error) {
 	procRootFD, err := unix.Open("/proc", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
 		return nil, fmt.Errorf("open /proc: %w", err)
 	}
-	defer unix.Close(procRootFD)
+	defer closeFD(procRootFD)
 
-	workerCount := min(max(runtime.GOMAXPROCS(0), 2), linuxMaxWorkers)
-	jobs := make(chan int, workerCount*linuxJobQueueFactor)
-	results := make(chan []Match, workerCount)
+	workerCount := min(max(runtime.GOMAXPROCS(0), linuxMinWorkers), linuxMaxWorkers)
+	jobs := make(chan linuxPIDJob, workerCount*linuxJobQueueFactor)
+	results := make(chan linuxMatchChunk, workerCount)
 
 	var workers sync.WaitGroup
 	for range workerCount {
-		workers.Add(1)
-		go func() {
-			defer workers.Done()
-
-			local := make([]Match, 0, 8)
-			for pid := range jobs {
-				processMatches, err := matchLinuxProcess(procRootFD, pid, queries, opt, sameRoot)
+		workers.Go(func() {
+			for job := range jobs {
+				processMatches, err := matchLinuxProcess(procRootFD, job.pid, queries, opt, sameRoot)
 				if err != nil || len(processMatches) == 0 {
 					continue
 				}
 
-				local = append(local, processMatches...)
+				results <- linuxMatchChunk{
+					order:   job.order,
+					matches: processMatches,
+				}
 			}
-
-			if len(local) > 0 {
-				results <- local
-			}
-		}()
+		})
 	}
 
 	stoppedByContext := false
+	jobCount := 0
 	produceErr := walkLinuxPIDs(ctx, procRootFD, func(pid int) bool {
+		job := linuxPIDJob{
+			pid:   pid,
+			order: jobCount,
+		}
+
+		jobCount++
+
 		select {
-		case jobs <- pid:
+		case jobs <- job:
 			return true
 		case <-ctx.Done():
 			stoppedByContext = true
+
 			return false
 		}
 	})
@@ -163,16 +204,21 @@ func findLinuxParallel(ctx context.Context, queries []query, opt FindOptions, sa
 	if produceErr == nil && stoppedByContext {
 		produceErr = ctx.Err()
 	}
+
 	if produceErr != nil {
 		return nil, fmt.Errorf("scan /proc: %w", produceErr)
 	}
 
-	matches := make([]Match, 0, initialMatchCapacity)
+	orderedChunks := make([][]Match, jobCount)
 	for chunk := range results {
+		orderedChunks[chunk.order] = chunk.matches
+	}
+
+	matches := make([]Match, 0, initialMatchCapacity)
+	for _, chunk := range orderedChunks {
 		matches = append(matches, chunk...)
 	}
 
-	sortMatches(matches)
 	return matches, nil
 }
 
@@ -182,14 +228,14 @@ func matchLinuxProcess(procRootFD, pid int, queries []query, opt FindOptions, sa
 
 	pidDirFD, err := unix.Openat(
 		procRootFD,
-		bytesToString(strconv.AppendInt(pidText[:0], int64(pid), 10)),
+		bytesToString(strconv.AppendInt(pidText[:0], int64(pid), linuxDecimalBase)),
 		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC,
 		0,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("open /proc/%d: %w", pid, err)
 	}
-	defer unix.Close(pidDirFD)
+	defer closeFD(pidDirFD)
 
 	return matchLinuxProcessAt(pid, pidDirFD, queries, opt, sameRoot)
 }
@@ -208,13 +254,14 @@ func matchLinuxProcessAt(pid, pidDirFD int, queries []query, opt FindOptions, sa
 	if state == 'D' && !opt.IncludeDState {
 		return nil, nil
 	}
+
 	if state == 'Z' && !opt.IncludeZombie {
 		return nil, nil
 	}
 
 	if sameRoot != "" {
-		root, err := readlinkAt(pidDirFD, "root")
-		if err != nil || root != sameRoot {
+		root, _ := readlinkAt(pidDirFD, "root")
+		if root != sameRoot {
 			return nil, nil
 		}
 	}
@@ -229,28 +276,42 @@ func matchLinuxProcessAt(pid, pidDirFD int, queries []query, opt FindOptions, sa
 	// exe and cmdline reads are relatively expensive, so keep them lazy and shared
 	// across all query checks for this pid.
 	var exe string
+
 	var exeLoaded bool
+
 	loadExe := func() string {
 		if exeLoaded {
 			return exe
 		}
+
 		exeLoaded = true
 		exe, _ = readlinkAt(pidDirFD, "exe")
+
 		return exe
 	}
 
 	var cmd cmdlineInfo
+
 	var cmdLoaded bool
+
+	cmdMode := cmdlineArgv0Only
+	if opt.ScriptsToo {
+		cmdMode = cmdlineWithScript
+	}
+
 	loadCmd := func() cmdlineInfo {
 		if cmdLoaded {
 			return cmd
 		}
+
 		cmdLoaded = true
-		cmd, _ = readCmdlineInfoAt(pidDirFD, opt.ScriptsToo)
+		cmd, _ = readCmdlineInfoAt(pidDirFD, cmdMode)
+
 		return cmd
 	}
 
-	matches := make([]Match, 0, 2)
+	matches := make([]Match, 0, linuxPerProcessMatchCap)
+
 	for _, query := range queries {
 		matched, name := linuxMatch(process, query, opt, loadExe, loadCmd)
 		if !matched {
@@ -279,6 +340,7 @@ func linuxMatch(process Process, query query, opt FindOptions, loadExe func() st
 		if !opt.LongNames {
 			return true, process.Name
 		}
+
 		return true, linuxDisplayName(process, loadExe(), cmdlineInfo{}, mode, regularMatch)
 	}
 
@@ -331,6 +393,7 @@ func linuxDisplayName(process Process, exe string, cmd cmdlineInfo, mode display
 		if exec := baseName(exe); exec != "" {
 			return exec
 		}
+
 		if argv0 := baseName(cmd.argv0); argv0 != "" {
 			return argv0
 		}
@@ -339,9 +402,11 @@ func linuxDisplayName(process Process, exe string, cmd cmdlineInfo, mode display
 	if name := baseName(process.Name); name != "" {
 		return name
 	}
+
 	if exec := baseName(exe); exec != "" {
 		return exec
 	}
+
 	return baseName(cmd.argv0)
 }
 
@@ -352,15 +417,16 @@ func walkLinuxProcDirs(ctx context.Context, fn func(pid, pidDirFD int) (stop boo
 	if err != nil {
 		return fmt.Errorf("open /proc: %w", err)
 	}
-	defer unix.Close(procRootFD)
+	defer closeFD(procRootFD)
 
 	var callbackErr error
+
 	err = walkLinuxPIDs(ctx, procRootFD, func(pid int) bool {
 		var pidText [linuxPIDTextSize]byte
 
 		pidDirFD, err := unix.Openat(
 			procRootFD,
-			bytesToString(strconv.AppendInt(pidText[:0], int64(pid), 10)),
+			bytesToString(strconv.AppendInt(pidText[:0], int64(pid), linuxDecimalBase)),
 			unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC,
 			0,
 		)
@@ -369,16 +435,20 @@ func walkLinuxProcDirs(ctx context.Context, fn func(pid, pidDirFD int) (stop boo
 		}
 
 		stop, cbErr := fn(pid, pidDirFD)
-		unix.Close(pidDirFD)
+		closeFD(pidDirFD)
+
 		if cbErr != nil {
 			callbackErr = cbErr
+
 			return false
 		}
+
 		return !stop
 	})
 	if err != nil {
 		return fmt.Errorf("walk /proc directories: %w", err)
 	}
+
 	return callbackErr
 }
 
@@ -395,6 +465,7 @@ func walkLinuxPIDs(ctx context.Context, procRootFD int, yield func(pid int) bool
 		if err != nil {
 			return fmt.Errorf("read /proc entries: %w", err)
 		}
+
 		if n == 0 {
 			return nil
 		}
@@ -404,9 +475,11 @@ func walkLinuxPIDs(ctx context.Context, procRootFD int, yield func(pid int) bool
 			if !ok {
 				break
 			}
+
 			if len(name) == 0 || name[0] == '.' {
 				continue
 			}
+
 			if typ != unix.DT_DIR && typ != unix.DT_UNKNOWN {
 				continue
 			}
@@ -415,6 +488,7 @@ func walkLinuxPIDs(ctx context.Context, procRootFD int, yield func(pid int) bool
 			if !ok || pid <= 0 {
 				continue
 			}
+
 			if !yield(pid) {
 				return nil
 			}
@@ -430,7 +504,7 @@ func readLinuxProcessAt(pid, pidDirFD int) (Process, error) {
 	}
 
 	exe, _ := readlinkAt(pidDirFD, "exe")
-	cmd, _ := readCmdlineInfoAt(pidDirFD, true)
+	cmd, _ := readCmdlineInfoAt(pidDirFD, cmdlineWithScript)
 
 	return Process{
 		PID:    pid,
@@ -461,7 +535,7 @@ func readSmallFileAt(dirFD int, name string, dst []byte) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("open %s: %w", name, err)
 	}
-	defer unix.Close(fd)
+	defer closeFD(fd)
 
 	n, err := unix.Read(fd, dst)
 	if err != nil {
@@ -472,13 +546,14 @@ func readSmallFileAt(dirFD int, name string, dst []byte) (int, error) {
 }
 
 // readCmdlineInfoAt reads argv0 and, optionally, the first script-like argument.
-func readCmdlineInfoAt(dirFD int, wantScript bool) (cmdlineInfo, error) {
+func readCmdlineInfoAt(dirFD int, mode cmdlineReadMode) (cmdlineInfo, error) {
 	var buf [linuxCmdlineBufferSize]byte
 
 	n, err := readSmallFileAt(dirFD, "cmdline", buf[:])
 	if err != nil {
 		return cmdlineInfo{}, fmt.Errorf("read cmdline: %w", err)
 	}
+
 	if n == 0 {
 		return cmdlineInfo{}, errors.New("read cmdline: empty file")
 	}
@@ -491,7 +566,8 @@ func readCmdlineInfoAt(dirFD int, wantScript bool) (cmdlineInfo, error) {
 	cmd := cmdlineInfo{
 		argv0: string(field),
 	}
-	if !wantScript {
+
+	if mode == cmdlineArgv0Only {
 		return cmd, nil
 	}
 
@@ -500,12 +576,15 @@ func readCmdlineInfoAt(dirFD int, wantScript bool) (cmdlineInfo, error) {
 		if !ok {
 			return cmd, nil
 		}
+
 		rest = next
+
 		if len(field) == 0 || field[0] == '-' {
 			continue
 		}
 
 		cmd.script = string(field)
+
 		return cmd, nil
 	}
 }
@@ -518,6 +597,7 @@ func readlinkAt(dirFD int, name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("readlink %s: %w", name, err)
 	}
+
 	if n <= 0 {
 		return "", fmt.Errorf("readlink %s: empty target", name)
 	}
@@ -528,25 +608,28 @@ func readlinkAt(dirFD int, name string) (string, error) {
 // parseProcStat extracts comm, state, and ppid from /proc/<pid>/stat.
 func parseProcStat(b []byte) (name string, state byte, ppid int, ok bool) {
 	open := bytes.IndexByte(b, '(')
-	close := bytes.LastIndexByte(b, ')')
-	if open < 0 || close <= open || close+4 > len(b) {
+
+	closeParen := bytes.LastIndexByte(b, ')')
+	if open < 0 || closeParen <= open || closeParen+4 > len(b) {
 		return "", 0, 0, false
 	}
 
-	name = string(b[open+1 : close])
+	name = string(b[open+1 : closeParen])
 
-	stateIndex := close + 2
+	stateIndex := closeParen + procStatStateOffset
 	if stateIndex >= len(b) {
 		return "", 0, 0, false
 	}
+
 	state = b[stateIndex]
 
-	ppidStart := stateIndex + 2
+	ppidStart := stateIndex + procStatPPIDOffset
 	if ppidStart >= len(b) {
 		return "", 0, 0, false
 	}
 
 	ppid, ok = parseInt(b[ppidStart:])
+
 	return name, state, ppid, ok
 }
 
@@ -558,21 +641,25 @@ func parseInt(b []byte) (int, bool) {
 
 	sign := 1
 	i := 0
+
 	if b[0] == '-' {
 		sign = -1
 		i++
 	}
+
 	if i >= len(b) || b[i] < '0' || b[i] > '9' {
 		return 0, false
 	}
 
 	n := 0
+
 	for ; i < len(b); i++ {
 		c := b[i]
 		if c < '0' || c > '9' {
 			break
 		}
-		n = n*10 + int(c-'0')
+
+		n = n*linuxDecimalBase + int(c-'0')
 	}
 
 	return sign * n, true
@@ -585,11 +672,13 @@ func parseUint(b []byte) (int, bool) {
 	}
 
 	n := 0
+
 	for _, c := range b {
 		if c < '0' || c > '9' {
 			return 0, false
 		}
-		n = n*10 + int(c-'0')
+
+		n = n*linuxDecimalBase + int(c-'0')
 	}
 
 	return n, true
@@ -607,13 +696,20 @@ func nextLinuxDirent(buf []byte, off *int) (typ uint8, name []byte, ok bool) {
 	}
 
 	typ = buf[*off+18]
+
 	name = buf[*off+19 : *off+reclen]
 	if i := bytes.IndexByte(name, 0); i >= 0 {
 		name = name[:i]
 	}
 
 	*off += reclen
+
 	return typ, name, true
+}
+
+// closeFD closes a procfs descriptor on a best-effort basis.
+func closeFD(fd int) {
+	_ = unix.Close(fd)
 }
 
 // bytesToString converts a short-lived byte slice to string without allocation.
@@ -621,5 +717,7 @@ func bytesToString(b []byte) string {
 	if len(b) == 0 {
 		return ""
 	}
+
+	//nolint:gosec // The string is used immediately for procfs path lookup and never outlives b.
 	return unsafe.String(&b[0], len(b))
 }

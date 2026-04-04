@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"slices"
+	"runtime"
 	"strconv"
 
 	"github.com/zerospiel/pidof/internal/process"
@@ -13,6 +13,7 @@ import (
 const (
 	maxIntTextSize            = 20
 	longMatchLineEstimateSize = 32
+	darwinLongLineEstimate    = 48
 	decimalBase               = 10
 )
 
@@ -46,8 +47,43 @@ func writePIDList(w io.Writer, matches []process.Match, sep string) error {
 	return nil
 }
 
-// writeLongMatches prints one match per line in query, pid, name form.
+// writeLongMatches prints matches using the current platform's compatibility
+// format.
 func writeLongMatches(w io.Writer, matches []process.Match) error {
+	if runtime.GOOS == "darwin" {
+		return writeDarwinLongMatches(w, matches)
+	}
+
+	return writeGenericLongMatches(w, matches)
+}
+
+// writeDarwinLongMatches prints the legacy macOS' pidof long output.
+func writeDarwinLongMatches(w io.Writer, matches []process.Match) error {
+	var buf bytes.Buffer
+	buf.Grow(len(matches) * darwinLongLineEstimate)
+
+	var scratch [maxIntTextSize]byte
+
+	for _, match := range matches {
+		_, _ = buf.WriteString("PID for ")
+		_, _ = buf.WriteString(match.Name)
+		_, _ = buf.WriteString(" is ")
+		_, _ = buf.Write(strconv.AppendInt(scratch[:0], int64(match.PID), decimalBase))
+		_, _ = buf.WriteString(" (")
+		_, _ = buf.WriteString(match.User)
+		_, _ = buf.WriteString(")\n")
+	}
+
+	_, err := w.Write(buf.Bytes())
+	if err != nil {
+		return fmt.Errorf("write darwin long match list: %w", err)
+	}
+
+	return nil
+}
+
+// writeGenericLongMatches prints one match per line in query, pid, name form.
+func writeGenericLongMatches(w io.Writer, matches []process.Match) error {
 	var buf bytes.Buffer
 	buf.Grow(len(matches) * longMatchLineEstimateSize)
 
@@ -70,28 +106,27 @@ func writeLongMatches(w io.Writer, matches []process.Match) error {
 	return nil
 }
 
-// uniquePIDs de-duplicates and sorts the pid set once before formatting or killing.
+// uniquePIDs de-duplicates the pid set while preserving the first-seen order.
 func uniquePIDs(matches []process.Match) []int {
 	if len(matches) == 0 {
 		return nil
 	}
 
-	pids := make([]int, len(matches))
-	for i, match := range matches {
-		pids[i] = match.PID
+	if len(matches) == 1 {
+		return []int{matches[0].PID}
 	}
 
-	slices.Sort(pids)
+	pids := make([]int, 0, len(matches))
+	seen := make(map[int]struct{}, len(matches))
 
-	uniqueCount := 1
-	for _, pid := range pids[1:] {
-		if pid == pids[uniqueCount-1] {
+	for _, match := range matches {
+		if _, ok := seen[match.PID]; ok {
 			continue
 		}
 
-		pids[uniqueCount] = pid
-		uniqueCount++
+		seen[match.PID] = struct{}{}
+		pids = append(pids, match.PID)
 	}
 
-	return pids[:uniqueCount]
+	return pids
 }

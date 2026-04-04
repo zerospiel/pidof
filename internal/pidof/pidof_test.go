@@ -6,6 +6,7 @@ import (
 	"io"
 	"maps"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -328,14 +329,14 @@ func Test_writePIDList(t *testing.T) {
 		want    string
 	}{
 		{
-			name: "deduplicates and sorts",
+			name: "deduplicates and preserves first seen order",
 			matches: []process.Match{
 				{PID: 44},
 				{PID: 12},
 				{PID: 44},
 			},
 			sep:  ",",
-			want: "12,44\n",
+			want: "44,12\n",
 		},
 		{
 			name: "empty match list",
@@ -353,6 +354,48 @@ func Test_writePIDList(t *testing.T) {
 			err := writePIDList(&stdout, test.matches, test.sep)
 			if err != nil {
 				t.Fatalf("writePIDList() error = %v", err)
+			}
+
+			if got := stdout.String(); got != test.want {
+				t.Fatalf("stdout = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func Test_writeLongMatches(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		matches []process.Match
+		want    string
+	}{
+		{
+			name: "single match",
+			matches: []process.Match{
+				{Query: "code", PID: 12, Name: "Code", User: "uname"},
+			},
+			want: map[bool]string{
+				true:  "PID for Code is 12 (uname)\n",
+				false: "code\t12\tCode\n",
+			}[runtime.GOOS == "darwin"],
+		},
+		{
+			name: "empty match list",
+			want: "",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			var stdout strings.Builder
+
+			err := writeLongMatches(&stdout, test.matches)
+			if err != nil {
+				t.Fatalf("writeLongMatches() error = %v", err)
 			}
 
 			if got := stdout.String(); got != test.want {
@@ -382,7 +425,7 @@ func Test_killMatches(t *testing.T) {
 			name:        "returns first real error",
 			matches:     []process.Match{{PID: 9}, {PID: 7}, {PID: 9}},
 			killErrs:    map[int]error{9: errors.New("boom")},
-			wantKilled:  []int{7, 9},
+			wantKilled:  []int{9, 7},
 			wantErrText: "kill 9: boom",
 		},
 	}

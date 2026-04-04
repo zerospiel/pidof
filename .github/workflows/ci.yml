@@ -67,12 +67,12 @@ jobs:
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
-          version: v2.15.0
+          version: v2.15.2
           args: check
 
       - name: Build all configured binaries
         uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
-          version: v2.15.0
+          version: v2.15.2
           args: build --snapshot --clean

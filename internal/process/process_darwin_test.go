@@ -31,6 +31,22 @@ func Test_darwinMatch(t *testing.T) {
 			wantCalls:   0,
 		},
 		{
+			name:        "case insensitive short name match",
+			short:       []byte("Code"),
+			query:       query{raw: "code", base: "code"},
+			wantMatched: true,
+			wantName:    "Code",
+			wantCalls:   0,
+		},
+		{
+			name:        "case insensitive substring short name match",
+			short:       []byte("Code Helper"),
+			query:       query{raw: "code", base: "code"},
+			wantMatched: true,
+			wantName:    "Code Helper",
+			wantCalls:   0,
+		},
+		{
 			name:  "script match",
 			short: []byte("python3"),
 			query: query{raw: "tool.py", base: "tool.py"},
@@ -41,7 +57,7 @@ func Test_darwinMatch(t *testing.T) {
 				script: "/tmp/tool.py",
 			},
 			wantMatched: true,
-			wantName:    "tool.py",
+			wantName:    "python3",
 			wantCalls:   1,
 		},
 	}

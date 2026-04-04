@@ -1,28 +1,10 @@
 package process
 
-import (
-	"bytes"
-	"cmp"
-	"slices"
-)
+import "bytes"
 
 const (
 	deletedSuffix        = " (deleted)"
 	initialMatchCapacity = 16
-)
-
-type matchKind uint8
-
-const (
-	regularMatch matchKind = iota
-	scriptMatch
-)
-
-type displayMode uint8
-
-const (
-	shortDisplay displayMode = iota
-	longDisplay
 )
 
 // query stores one normalized lookup target together with its basename fast path.
@@ -35,17 +17,6 @@ func shouldOmit(pid int, omit map[int]struct{}) bool {
 	_, ok := omit[pid]
 
 	return ok
-}
-
-// sortMatches keeps output deterministic after platform-specific scans.
-func sortMatches(matches []Match) {
-	slices.SortFunc(matches, func(a, b Match) int {
-		if diff := cmp.Compare(a.Query, b.Query); diff != 0 {
-			return diff
-		}
-
-		return cmp.Compare(a.PID, b.PID)
-	})
 }
 
 // nextNULField splits a NUL-delimited byte sequence without allocating.

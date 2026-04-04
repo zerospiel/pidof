@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"os/user"
+	"strconv"
 
 	"golang.org/x/sys/unix"
 )
@@ -15,6 +17,8 @@ type darwinProcArgs struct {
 	argv0  string
 	script string
 }
+
+const darwinUserCacheCap = 8
 
 // nativeList returns a full Darwin process snapshot from the kernel process table.
 func nativeList(ctx context.Context) ([]Process, error) {
@@ -68,8 +72,9 @@ func nativeFind(ctx context.Context, names []string, opt FindOptions) ([]Match, 
 	}
 
 	matches := make([]Match, 0, initialMatchCapacity)
+	userNames := make(map[uint32]string, darwinUserCacheCap)
 
-	for i := range kprocs {
+	for i := len(kprocs) - 1; i >= 0; i-- {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("find processes: %w", err)
 		}
@@ -90,7 +95,7 @@ func nativeFind(ctx context.Context, names []string, opt FindOptions) ([]Match, 
 
 		short = short[:shortLen]
 
-		// Long-name and script matching require a slower kern.procargs2 lookup, so
+		// Path and script matching require a slower kern.procargs2 lookup, so
 		// keep it lazy and pay for it only once per candidate PID.
 		var (
 			procArgs   darwinProcArgs
@@ -118,6 +123,7 @@ func nativeFind(ctx context.Context, names []string, opt FindOptions) ([]Match, 
 				Query: query.raw,
 				PID:   pid,
 				Name:  name,
+				User:  darwinUserName(kp.Eproc.Ucred.Uid, userNames),
 			})
 			if opt.Single {
 				return matches, nil
@@ -125,27 +131,18 @@ func nativeFind(ctx context.Context, names []string, opt FindOptions) ([]Match, 
 		}
 	}
 
-	sortMatches(matches)
-
 	return matches, nil
 }
 
 // darwinMatch resolves a query against the short name first, then lazily consults
 // argv data only when the short-name fast path is insufficient.
 func darwinMatch(short []byte, query query, opt FindOptions, loadArgs func() darwinProcArgs) (bool, string) {
-	mode := shortDisplay
-	if opt.LongNames {
-		mode = longDisplay
+	if !query.fullPath && cStringEqual(short, query.base) {
+		return true, string(short)
 	}
 
-	if !query.fullPath && cStringEqual(short, query.base) {
-		if !opt.LongNames {
-			return true, query.base
-		}
-
-		procArgs := loadArgs()
-
-		return true, darwinDisplayName(short, procArgs, mode, regularMatch)
+	if !query.fullPath && cStringContainsFold(short, query.base) {
+		return true, string(short)
 	}
 
 	if !query.fullPath && !opt.ScriptsToo && (len(short) >= len(query.base) || !cStringPrefix(short, query.base)) {
@@ -157,47 +154,26 @@ func darwinMatch(short []byte, query query, opt FindOptions, loadArgs func() dar
 	if query.fullPath {
 		switch {
 		case samePath(procArgs.exec, query.raw):
-			return true, darwinDisplayName(short, procArgs, mode, regularMatch)
+			return true, string(short)
 		case samePath(procArgs.argv0, query.raw):
-			return true, darwinDisplayName(short, procArgs, mode, regularMatch)
+			return true, string(short)
 		case opt.ScriptsToo && samePath(procArgs.script, query.raw):
-			return true, darwinDisplayName(short, procArgs, mode, scriptMatch)
+			return true, string(short)
 		default:
 			return false, ""
 		}
 	}
 
 	switch {
-	case baseName(procArgs.exec) == query.base:
-		return true, darwinDisplayName(short, procArgs, mode, regularMatch)
-	case baseName(procArgs.argv0) == query.base:
-		return true, darwinDisplayName(short, procArgs, mode, regularMatch)
-	case opt.ScriptsToo && baseName(procArgs.script) == query.base:
-		return true, darwinDisplayName(short, procArgs, mode, scriptMatch)
+	case stringContainsFold(baseName(procArgs.exec), query.base):
+		return true, string(short)
+	case stringContainsFold(baseName(procArgs.argv0), query.base):
+		return true, string(short)
+	case opt.ScriptsToo && stringContainsFold(baseName(procArgs.script), query.base):
+		return true, string(short)
 	default:
 		return false, ""
 	}
-}
-
-// darwinDisplayName picks the most informative printable name without extra work.
-func darwinDisplayName(short []byte, procArgs darwinProcArgs, mode displayMode, kind matchKind) string {
-	if kind == scriptMatch {
-		if script := baseName(procArgs.script); script != "" {
-			return script
-		}
-	}
-
-	if mode == longDisplay {
-		if argv0 := baseName(procArgs.argv0); argv0 != "" {
-			return argv0
-		}
-
-		if exec := baseName(procArgs.exec); exec != "" {
-			return exec
-		}
-	}
-
-	return string(short)
 }
 
 // readDarwinProcArgs extracts exec, argv0, and the first script argument from
@@ -248,6 +224,24 @@ func readDarwinProcArgs(pid int) darwinProcArgs {
 	return procArgs
 }
 
+// darwinUserName resolves a numeric uid to the long-output login name format.
+func darwinUserName(uid uint32, cache map[uint32]string) string {
+	if name, ok := cache[uid]; ok {
+		return name
+	}
+
+	name := strconv.FormatUint(uint64(uid), 10)
+
+	entry, err := user.LookupId(name)
+	if err == nil && entry.Username != "" {
+		name = entry.Username
+	}
+
+	cache[uid] = name
+
+	return name
+}
+
 // cStringLen reports the length up to the first NUL byte.
 func cStringLen(b []byte) int {
 	for i, c := range b {
@@ -287,4 +281,88 @@ func cStringPrefix(p []byte, s string) bool {
 	}
 
 	return true
+}
+
+// cStringContainsFold reports whether the C-style byte slice contains s under
+// an ASCII-only case fold.
+func cStringContainsFold(p []byte, s string) bool {
+	if len(s) == 0 || len(p) < len(s) {
+		return false
+	}
+
+	first := foldASCII(s[0])
+
+	limit := len(p) - len(s)
+	for i := 0; i <= limit; i++ {
+		if foldASCII(p[i]) != first {
+			continue
+		}
+
+		if cStringEqualFold(p[i:i+len(s)], s) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// cStringEqualFold compares a C-style byte slice and string with ASCII folding.
+func cStringEqualFold(p []byte, s string) bool {
+	if len(p) != len(s) {
+		return false
+	}
+
+	for i := range p {
+		if foldASCII(p[i]) != foldASCII(s[i]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// stringContainsFold reports whether p contains s under an ASCII-only case fold.
+func stringContainsFold(p, s string) bool {
+	if len(s) == 0 || len(p) < len(s) {
+		return false
+	}
+
+	first := foldASCII(s[0])
+
+	limit := len(p) - len(s)
+	for i := 0; i <= limit; i++ {
+		if foldASCII(p[i]) != first {
+			continue
+		}
+
+		if stringEqualFold(p[i:i+len(s)], s) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// stringEqualFold compares two strings with ASCII folding only.
+func stringEqualFold(p, s string) bool {
+	if len(p) != len(s) {
+		return false
+	}
+
+	for i := range p {
+		if foldASCII(p[i]) != foldASCII(s[i]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// foldASCII lowercases one ASCII byte without paying Unicode case-fold costs.
+func foldASCII(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+
+	return b
 }

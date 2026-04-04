@@ -43,12 +43,15 @@ func Test_parseProcStat(t *testing.T) {
 			if ok != test.wantOK {
 				t.Fatalf("ok = %v, want %v", ok, test.wantOK)
 			}
+
 			if name != test.wantName {
 				t.Fatalf("name = %q, want %q", name, test.wantName)
 			}
+
 			if state != test.wantState {
 				t.Fatalf("state = %q, want %q", state, test.wantState)
 			}
+
 			if ppid != test.wantPPID {
 				t.Fatalf("ppid = %d, want %d", ppid, test.wantPPID)
 			}
@@ -126,6 +129,15 @@ func Test_linuxMatch(t *testing.T) {
 			wantMatched: true,
 			wantName:    "bash",
 		},
+		{
+			name:        "matches interpreter executable exactly",
+			process:     Process{Name: "bashlike.sh"},
+			query:       query{raw: "bash", base: "bash"},
+			exe:         "/bin/bash",
+			cmd:         cmdlineInfo{argv0: "/tmp/bashlike.sh"},
+			wantMatched: true,
+			wantName:    "bashlike.sh",
+		},
 	}
 
 	for _, test := range tests {
@@ -142,6 +154,7 @@ func Test_linuxMatch(t *testing.T) {
 			if matched != test.wantMatched {
 				t.Fatalf("matched = %v, want %v", matched, test.wantMatched)
 			}
+
 			if name != test.wantName {
 				t.Fatalf("name = %q, want %q", name, test.wantName)
 			}
@@ -171,10 +184,12 @@ func TestFind(t *testing.T) {
 	t.Parallel()
 
 	query := baseName(os.Args[0])
+
 	matches, err := Find(context.Background(), []string{query}, FindOptions{Single: true})
 	if err != nil {
 		t.Fatalf("Find() error = %v", err)
 	}
+
 	if len(matches) == 0 {
 		t.Fatal(errors.New("current process query returned no matches"))
 	}
