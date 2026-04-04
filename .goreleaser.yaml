@@ -102,6 +102,6 @@ brews:
     license: "MIT"
     skip_upload: auto
     commit_msg_template: "Brew formula update for {{ .ProjectName }} version {{ .Tag }}"
-    description: Display the PID number for a given process name(s). Drop-in replacement for the deprecated NightProductions pidof.
+    description: Display the PID number for a given process name(s)
     test: |
       assert_match "pidof", shell_output("#{bin}/pidof --version")
