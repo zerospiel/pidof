@@ -72,24 +72,11 @@ release:
   draft: false
   prerelease: auto
   mode: replace
-  header: |
-    ## pidof {{ .Tag }}
 
-  footer: |
-    ---
-    ## Homebrew
-
-    Install:
-
-    `brew install zerospiel/tools/pidof`
-    ---
-    **Full Changelog**: https://github.com/zerospiel/pidof/compare/{{ .PreviousTag }}...{{ .Tag }}
-
-brews:
+homebrew_casks:
   - name: pidof
     ids:
       - tarballs
-    directory: Formula
     repository:
       owner: zerospiel
       name: homebrew-tools
@@ -99,9 +86,12 @@ brews:
     commit_author:
       name: goreleaserbot
       email: bot@goreleaser.com
-    license: "MIT"
     skip_upload: auto
-    commit_msg_template: "Brew formula update for {{ .ProjectName }} version {{ .Tag }}"
+    commit_msg_template: "Brew cask update for {{ .ProjectName }} version {{ .Tag }}"
     description: Display the PID number for a given process name(s)
-    test: |
-      assert_match "pidof", shell_output("#{bin}/pidof -v")
+    hooks:
+      post:
+        install: |
+          if OS.mac?
+            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/pidof"]
+          end
