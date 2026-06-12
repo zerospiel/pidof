@@ -10,9 +10,9 @@ type Match struct {
 	PID   int
 }
 
-// FindOptions tunes process matching. On Darwin, LongNames enables slower
-// compatibility checks against argv and exec paths; on Linux it also influences
-// the richer display name used by long output.
+// FindOptions tunes process matching. LongNames currently only affects the
+// Linux backend's display-name selection; the Darwin backend always falls back
+// to argv/exec inspection when the short comm name doesn't match.
 type FindOptions struct {
 	Omit          map[int]struct{}
 	LongNames     bool

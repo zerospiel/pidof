@@ -1,6 +1,9 @@
 package process
 
-import "strings"
+import (
+	"slices"
+	"strings"
+)
 
 // query stores one normalized lookup target together with its basename fast path.
 type query struct {
@@ -9,9 +12,10 @@ type query struct {
 	fullPath bool
 }
 
-// compileQueries normalizes user input once so the hot matching loops can stay simple.
+// compileQueries normalizes user input once so the hot matching loops can stay
+// simple. Inputs are tiny (a handful at most), so a linear scan beats the per
+// call map allocation for dedup.
 func compileQueries(input []string) []query {
-	seen := make(map[string]struct{}, len(input))
 	queries := make([]query, 0, len(input))
 
 	for _, raw := range input {
@@ -20,15 +24,13 @@ func compileQueries(input []string) []query {
 			continue
 		}
 
-		if _, ok := seen[raw]; ok {
+		if slices.ContainsFunc(queries, func(q query) bool { return q.raw == raw }) {
 			continue
 		}
 
-		seen[raw] = struct{}{}
-
 		queries = append(queries, query{
 			raw:      raw,
-			base:     baseName(raw),
+			base:     baseNameOf(raw),
 			fullPath: strings.IndexByte(raw, '/') >= 0,
 		})
 	}
@@ -59,9 +61,18 @@ func normalizeInput(s string) string {
 	}
 }
 
-// baseName extracts the last path component using slash semantics on all targets.
+// baseName extracts the last path component using slash semantics on all
+// targets. It is the safe entry point for callers that may receive untrimmed
+// or shell-noisy strings (e.g. procfs cmdline data, kern.procargs2 fields).
 func baseName(s string) string {
-	s = normalizeInput(s)
+	return baseNameOf(normalizeInput(s))
+}
+
+// baseNameOf is the basename fast path for callers that have already passed
+// the input through normalizeInput. It skips the redundant trim/cut work that
+// dominates baseName when the input is known to be clean (compileQueries does
+// exactly this once per query).
+func baseNameOf(s string) string {
 	if s == "" {
 		return ""
 	}

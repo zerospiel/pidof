@@ -6,19 +6,52 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"os"
 	"os/user"
+	"slices"
 	"strconv"
+	"sync"
 
 	"golang.org/x/sys/unix"
 )
 
 type darwinProcArgs struct {
-	exec   string
-	argv0  string
-	script string
+	exec       string
+	execBase   string
+	argv0      string
+	argv0Base  string
+	script     string
+	scriptBase string
 }
 
 const darwinUserCacheCap = 8
+
+// darwinCurrentUser caches the effective uid and its resolved login name for
+// the lifetime of the process. The first Open Directory / getpwuid_r round
+// trip is the single most expensive cgo call in the -l path; lifting it out
+// of Find keeps every per-Find user cache primed for the overwhelmingly
+// common "matches belong to the calling user" case.
+var darwinCurrentUser = sync.OnceValues(func() (uint32, string) {
+	uid := os.Geteuid()
+	if uid < 0 {
+		return 0, ""
+	}
+
+	uidU := uint32(uid)
+
+	return uidU, resolveDarwinUserName(uidU)
+})
+
+func resolveDarwinUserName(uid uint32) string {
+	name := strconv.FormatUint(uint64(uid), 10)
+
+	entry, err := user.LookupId(name)
+	if err == nil && entry.Username != "" {
+		return entry.Username
+	}
+
+	return name
+}
 
 // nativeFind scans the Darwin kinfo table sequentially because the source data is already
 // in one contiguous kernel buffer, so extra goroutines would mostly add scheduling
@@ -35,14 +68,24 @@ func nativeFind(ctx context.Context, names []string, opt FindOptions) ([]Match, 
 	}
 
 	matches := make([]Match, 0, initialMatchCapacity)
-	userNames := make(map[uint32]string, darwinUserCacheCap)
 
-	for i := len(kprocs) - 1; i >= 0; i-- {
+	// Without -l the User field is never printed, so skip the entire login
+	// name resolution path (cgo into opendirectoryd on macOS).
+	var userNames map[uint32]string
+	if opt.LongNames {
+		userNames = make(map[uint32]string, darwinUserCacheCap)
+
+		if uid, name := darwinCurrentUser(); name != "" {
+			userNames[uid] = name
+		}
+	}
+
+	for _, v := range slices.Backward(kprocs) {
 		if err := ctx.Err(); err != nil {
 			return nil, fmt.Errorf("find processes: %w", err)
 		}
 
-		kp := &kprocs[i]
+		kp := &v
 
 		pid := int(kp.Proc.P_pid)
 		if pid <= 0 || shouldOmit(pid, opt.Omit) {
@@ -63,6 +106,9 @@ func nativeFind(ctx context.Context, names []string, opt FindOptions) ([]Match, 
 		var (
 			procArgs   darwinProcArgs
 			argsLoaded bool
+
+			userName     string
+			userResolved bool
 		)
 
 		loadArgs := func() darwinProcArgs {
@@ -82,11 +128,16 @@ func nativeFind(ctx context.Context, names []string, opt FindOptions) ([]Match, 
 				continue
 			}
 
+			if opt.LongNames && !userResolved {
+				userResolved = true
+				userName = darwinUserName(kp.Eproc.Ucred.Uid, userNames)
+			}
+
 			matches = append(matches, Match{
 				Query: query.raw,
 				PID:   pid,
 				Name:  name,
-				User:  darwinUserName(kp.Eproc.Ucred.Uid, userNames),
+				User:  userName,
 			})
 			if opt.Single {
 				return matches, nil
@@ -128,11 +179,11 @@ func darwinMatch(short []byte, query query, opt FindOptions, loadArgs func() dar
 	}
 
 	switch {
-	case stringContainsFold(baseName(procArgs.exec), query.base):
+	case stringContainsFold(procArgs.execBase, query.base):
 		return true, string(short)
-	case stringContainsFold(baseName(procArgs.argv0), query.base):
+	case stringContainsFold(procArgs.argv0Base, query.base):
 		return true, string(short)
-	case opt.ScriptsToo && stringContainsFold(baseName(procArgs.script), query.base):
+	case opt.ScriptsToo && stringContainsFold(procArgs.scriptBase, query.base):
 		return true, string(short)
 	default:
 		return false, ""
@@ -167,8 +218,12 @@ func readDarwinProcArgs(pid int) darwinProcArgs {
 		argv0: string(argv0),
 	}
 
+	procArgs.execBase = baseName(procArgs.exec)
+	procArgs.argv0Base = baseName(procArgs.argv0)
+
 	if argc > 1 {
-		procArgs.script = firstScriptArgN(procArgs.argv0, rest, argc-1)
+		procArgs.script = firstScriptArgN(procArgs.argv0Base, rest, argc-1)
+		procArgs.scriptBase = baseName(procArgs.script)
 	}
 
 	return procArgs
@@ -180,13 +235,7 @@ func darwinUserName(uid uint32, cache map[uint32]string) string {
 		return name
 	}
 
-	name := strconv.FormatUint(uint64(uid), 10)
-
-	entry, err := user.LookupId(name)
-	if err == nil && entry.Username != "" {
-		name = entry.Username
-	}
-
+	name := resolveDarwinUserName(uid)
 	cache[uid] = name
 
 	return name
@@ -285,34 +334,10 @@ func stringContainsFold(p, s string) bool {
 			continue
 		}
 
-		if stringEqualFold(p[i:i+len(s)], s) {
+		if stringEqualASCIIFold(p[i:i+len(s)], s) {
 			return true
 		}
 	}
 
 	return false
-}
-
-// stringEqualFold compares two strings with ASCII folding only.
-func stringEqualFold(p, s string) bool {
-	if len(p) != len(s) {
-		return false
-	}
-
-	for i := range p {
-		if foldASCII(p[i]) != foldASCII(s[i]) {
-			return false
-		}
-	}
-
-	return true
-}
-
-// foldASCII lowercases one ASCII byte without paying Unicode case-fold costs.
-func foldASCII(b byte) byte {
-	if b >= 'A' && b <= 'Z' {
-		return b + ('a' - 'A')
-	}
-
-	return b
 }

@@ -13,7 +13,7 @@ help: ## Display this help.
 $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
 
-GOLANGCI_LINT_VERSION ?= v2.11.4
+GOLANGCI_LINT_VERSION ?= v2.12.2
 GORELEASER_VERSION ?= v2.15.2
 GOLANGCI_LINT ?= $(LOCALBIN)/golangci-lint
 GORELEASER ?= $(LOCALBIN)/goreleaser

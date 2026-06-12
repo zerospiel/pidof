@@ -8,6 +8,7 @@ import (
 	"os"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -310,6 +311,14 @@ func TestResolve(t *testing.T) {
 func Test_writePIDList(t *testing.T) {
 	t.Parallel()
 
+	largeMatches := make([]process.Match, 0, uniquePIDLinearLimit+5)
+	for i := range uniquePIDLinearLimit + 5 {
+		largeMatches = append(largeMatches, process.Match{PID: i + 1})
+	}
+
+	// Duplicate the first half so the map-fallback de-dup actually has work.
+	largeMatches = append(largeMatches, largeMatches[:uniquePIDLinearLimit/2]...)
+
 	tests := []struct {
 		name    string
 		matches []process.Match
@@ -327,9 +336,23 @@ func Test_writePIDList(t *testing.T) {
 			want: "44,12\n",
 		},
 		{
+			name: "single match short circuits",
+			matches: []process.Match{
+				{PID: 7},
+			},
+			sep:  " ",
+			want: "7\n",
+		},
+		{
 			name: "empty match list",
 			sep:  " ",
 			want: "",
+		},
+		{
+			name:    "large match list takes the map fallback",
+			matches: largeMatches,
+			sep:     " ",
+			want:    largePIDListWant(uniquePIDLinearLimit+5) + "\n",
 		},
 	}
 
@@ -349,6 +372,20 @@ func Test_writePIDList(t *testing.T) {
 			}
 		})
 	}
+}
+
+func largePIDListWant(n int) string {
+	var b strings.Builder
+
+	for i := range n {
+		if i > 0 {
+			_ = b.WriteByte(' ')
+		}
+
+		_, _ = b.WriteString(strconv.Itoa(i + 1))
+	}
+
+	return b.String()
 }
 
 func Test_writeLongMatches(t *testing.T) {

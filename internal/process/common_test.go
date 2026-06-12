@@ -224,8 +224,8 @@ func Test_firstScriptArg(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := firstScriptArg(test.argv0, joinNULFields(test.rest...)); got != test.want {
-				t.Fatalf("firstScriptArg(%q, %v) = %q, want %q", test.argv0, test.rest, got, test.want)
+			if got := firstScriptArgN(baseName(test.argv0), joinNULFields(test.rest...), -1); got != test.want {
+				t.Fatalf("firstScriptArgN(%q, %v) = %q, want %q", test.argv0, test.rest, got, test.want)
 			}
 		})
 	}
@@ -261,7 +261,7 @@ func Test_firstScriptArgN(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			if got := firstScriptArgN(test.argv0, joinNULFields(test.rest...), test.maxFields); got != test.want {
+			if got := firstScriptArgN(baseName(test.argv0), joinNULFields(test.rest...), test.maxFields); got != test.want {
 				t.Fatalf(
 					"firstScriptArgN(%q, %v, %d) = %q, want %q",
 					test.argv0,
@@ -284,4 +284,130 @@ func joinNULFields(fields ...string) []byte {
 	}
 
 	return joined
+}
+
+func Test_shouldOmit(t *testing.T) {
+	t.Parallel()
+
+	if shouldOmit(42, nil) {
+		t.Fatal("shouldOmit(42, nil) = true, want false")
+	}
+
+	if shouldOmit(42, map[int]struct{}{}) {
+		t.Fatal("shouldOmit(42, empty) = true, want false")
+	}
+
+	omit := map[int]struct{}{1: {}, 99: {}}
+
+	if !shouldOmit(99, omit) {
+		t.Fatal("shouldOmit(99, populated) = false, want true")
+	}
+
+	if shouldOmit(7, omit) {
+		t.Fatal("shouldOmit(7, populated) = true, want false")
+	}
+}
+
+func Test_detectScriptRuntime(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		argv0 string
+		want  scriptRuntime
+	}{
+		{name: "empty input is unknown", argv0: "", want: scriptRuntimeUnknown},
+		{name: "plain shell name", argv0: "sh", want: scriptRuntimeShell},
+		{name: "case insensitive shell name", argv0: "BaSh", want: scriptRuntimeShell},
+		{name: "python prefix", argv0: "python3.12", want: scriptRuntimePython},
+		{name: "pypy prefix", argv0: "PyPy3", want: scriptRuntimePython},
+		{name: "unrelated binary", argv0: "vim", want: scriptRuntimeUnknown},
+		{name: "longer-than-any-shell falls through", argv0: "averyverylongbin", want: scriptRuntimeUnknown},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := detectScriptRuntime(test.argv0); got != test.want {
+				t.Fatalf("detectScriptRuntime(%q) = %v, want %v", test.argv0, got, test.want)
+			}
+		})
+	}
+}
+
+func Test_scriptSearchStops(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		runtime scriptRuntime
+		field   []byte
+		want    bool
+	}{
+		{name: "unknown runtime never stops", runtime: scriptRuntimeUnknown, field: []byte("-c"), want: false},
+		{name: "shell -c stops", runtime: scriptRuntimeShell, field: []byte("-c"), want: true},
+		{name: "shell -l does not stop", runtime: scriptRuntimeShell, field: []byte("-l"), want: false},
+		{name: "python -m stops", runtime: scriptRuntimePython, field: []byte("-m"), want: true},
+		{name: "python -I does not stop", runtime: scriptRuntimePython, field: []byte("-I"), want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := scriptSearchStops(test.runtime, test.field); got != test.want {
+				t.Fatalf("scriptSearchStops(%v, %q) = %v, want %v", test.runtime, test.field, got, test.want)
+			}
+		})
+	}
+}
+
+func Test_stringEqualASCIIFold(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		a, b string
+		want bool
+	}{
+		{name: "equal length match", a: "Bash", b: "bash", want: true},
+		{name: "different length", a: "bash", b: "ba", want: false},
+		{name: "different content", a: "bash", b: "kash", want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := stringEqualASCIIFold(test.a, test.b); got != test.want {
+				t.Fatalf("stringEqualASCIIFold(%q, %q) = %v, want %v", test.a, test.b, got, test.want)
+			}
+		})
+	}
+}
+
+func Test_stringHasASCIIPrefixFold(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		s      string
+		prefix string
+		want   bool
+	}{
+		{name: "match", s: "Python3.12", prefix: "python", want: true},
+		{name: "shorter than prefix", s: "py", prefix: "python", want: false},
+		{name: "different prefix", s: "ruby", prefix: "python", want: false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+
+			if got := stringHasASCIIPrefixFold(test.s, test.prefix); got != test.want {
+				t.Fatalf("stringHasASCIIPrefixFold(%q, %q) = %v, want %v", test.s, test.prefix, got, test.want)
+			}
+		})
+	}
 }

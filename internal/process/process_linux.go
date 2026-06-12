@@ -4,12 +4,13 @@ package process
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"os"
 	"runtime"
+	"slices"
 	"strconv"
 	"sync"
 	"unsafe"
@@ -22,31 +23,41 @@ const (
 	linuxStatBufferSize     = 512
 	linuxCmdlineBufferSize  = 4096
 	linuxReadlinkBufferSize = 4096
-	linuxPIDTextSize        = 20
+	// linuxCommMaxLen is TASK_COMM_LEN: the kernel silently truncates comm to
+	// 16 bytes including the terminating NUL, which makes 15 the largest comm
+	// length we can ever see in /proc/<pid>/stat. We round to 16 to give the
+	// copy loop a power-of-two byte count.
+	linuxCommMaxLen = 16
+	// linuxMaxProcPathSize covers "<pid>/<longest-file>\x00" with margin.
+	// "<pid>" is at most 10 digits on 64-bit Linux (PIDs are 32-bit), the longest
+	// suffix we use is "/cmdline\x00" (9 bytes), so 24 fits comfortably; we round
+	// up to 32 to keep the buffer 4-word aligned and absorb future growth.
+	linuxMaxProcPathSize    = 32
 	linuxMaxWorkers         = 8
 	linuxMinWorkers         = 2
 	linuxJobQueueFactor     = 2
-	linuxWorkerMatchCap     = 8
 	linuxPerProcessMatchCap = 2
 	linuxDecimalBase        = 10
 	procStatStateOffset     = 2
-	procStatPPIDOffset      = 2
+)
+
+// Per-suffix NUL-terminated string literals, so the path builder can append
+// them verbatim and the raw openat/readlinkat helpers can pass &path[0]
+// straight to the kernel without a stringification + BytePtrFromString round
+// trip. As consts they live in the binary's rodata, which is immutable and
+// adds zero per-call work.
+const (
+	procSuffixStat    = "/stat\x00"
+	procSuffixCmdline = "/cmdline\x00"
+	procSuffixExe     = "/exe\x00"
+	procSuffixRoot    = "/root\x00"
 )
 
 type cmdlineInfo struct {
-	argv0  string
-	script string
-}
-
-// processInfo carries the per-process fields the Linux matcher needs.
-type processInfo struct {
-	Name   string
-	Exe    string
-	Argv0  string
-	Script string
-	PID    int
-	PPID   int
-	State  byte
+	argv0      string
+	argv0Base  string
+	script     string
+	scriptBase string
 }
 
 type matchKind uint8
@@ -70,6 +81,102 @@ const (
 	cmdlineWithScript
 )
 
+// lazyProc carries the per-PID state used by linuxMatch. It owns the lazy reads
+// of exe and cmdline so the hot fast path that resolves a query against
+// /proc/<pid>/stat alone never triggers the extra syscalls.
+//
+// The struct is intentionally referenced via *lazyProc from a stack-local
+// instance inside matchLinuxProcessAt so escape analysis keeps it on the
+// caller's stack. The comm bytes are copied into a fixed-size array (rather
+// than referenced as a slice into the caller's stat buffer) so the stat buffer
+// stays on the stack; comm is bounded to TASK_COMM_LEN (16) bytes by the
+// kernel. The string form of the comm is materialised lazily only when a
+// query actually matches.
+type lazyProc struct {
+	name     string
+	nameBase string
+	exe      string
+	exeBase  string
+
+	cmd cmdlineInfo
+
+	procRootFD int
+	pid        int
+
+	nameBytes [linuxCommMaxLen]byte
+	nameLen   uint8
+
+	cmdMode cmdlineReadMode
+
+	nameLoaded     bool
+	nameBaseLoaded bool
+	exeLoaded      bool
+	cmdLoaded      bool
+}
+
+// NameEquals reports whether the comm name equals s without materialising the
+// comm bytes as a Go string. The compiler rewrites string(b) == s to a
+// byte-by-byte compare with no allocation.
+func (l *lazyProc) NameEquals(s string) bool {
+	return string(l.nameSlice()) == s
+}
+
+// Name returns the comm name as a Go string, materialising it on first use.
+func (l *lazyProc) Name() string {
+	if !l.nameLoaded {
+		l.nameLoaded = true
+		l.name = string(l.nameSlice())
+	}
+
+	return l.name
+}
+
+// NameBase returns baseName(Name()) memoised across queries.
+func (l *lazyProc) NameBase() string {
+	if !l.nameBaseLoaded {
+		l.nameBaseLoaded = true
+		l.nameBase = baseName(l.Name())
+	}
+
+	return l.nameBase
+}
+
+// Exe returns the resolved /proc/<pid>/exe symlink target, loading it on first
+// use. The base name is memoized in the same step to avoid re-scanning the
+// path for every query against the same pid.
+func (l *lazyProc) Exe() string {
+	if !l.exeLoaded {
+		l.exeLoaded = true
+		l.exe = procReadlink(l.procRootFD, l.pid, procSuffixExe)
+		l.exeBase = baseName(l.exe)
+	}
+
+	return l.exe
+}
+
+// ExeBase returns baseName(Exe()) without recomputing the basename.
+func (l *lazyProc) ExeBase() string {
+	l.Exe()
+
+	return l.exeBase
+}
+
+// Cmd returns the parsed /proc/<pid>/cmdline, loading it on first use.
+func (l *lazyProc) Cmd() cmdlineInfo {
+	if !l.cmdLoaded {
+		l.cmdLoaded = true
+		l.cmd = procReadCmdline(l.procRootFD, l.pid, l.cmdMode)
+	}
+
+	return l.cmd
+}
+
+// nameSlice returns the comm bytes as a slice. The slice aliases the on-stack
+// array, so callers must not retain it beyond the lazyProc's lifetime.
+func (l *lazyProc) nameSlice() []byte {
+	return l.nameBytes[:l.nameLen]
+}
+
 type linuxPIDJob struct {
 	pid   int
 	order int
@@ -80,8 +187,9 @@ type linuxMatchChunk struct {
 	order   int
 }
 
-// nativeFind uses a sequential fast path for single-shot lookups and a bounded worker
-// pool for broader scans, where overlapping /proc syscalls tends to win on Linux.
+// nativeFind uses a sequential fast path for single-shot lookups and a bounded
+// worker pool for broader scans, where overlapping /proc syscalls tend to win
+// on Linux.
 func nativeFind(ctx context.Context, names []string, opt FindOptions) ([]Match, error) {
 	queries := compileQueries(names)
 	if len(queries) == 0 {
@@ -100,11 +208,11 @@ func nativeFind(ctx context.Context, names []string, opt FindOptions) ([]Match, 
 	return findLinuxParallel(ctx, queries, opt, sameRoot)
 }
 
-// linuxSameRoot resolves the caller root path only when -c is both requested and
-// meaningful. This matches pidof's root-only behavior without penalizing the
-// common case.
+// linuxSameRoot resolves the caller root path only when -c is both requested
+// and meaningful. This matches pidof's root-only behavior without penalizing
+// the common case.
 func linuxSameRoot() string {
-	if os.Geteuid() != 0 {
+	if linuxEuidOnce() != 0 {
 		return ""
 	}
 
@@ -116,23 +224,33 @@ func linuxSameRoot() string {
 	return root
 }
 
+// linuxEuidOnce caches the process effective uid; it never changes for the
+// lifetime of the process so we avoid the per-Find geteuid syscall.
+var linuxEuidOnce = sync.OnceValue(os.Geteuid)
+
 // findLinuxSequential keeps procfs encounter order intact and avoids extra
 // goroutine setup for single-shot queries.
 func findLinuxSequential(ctx context.Context, queries []query, opt FindOptions, sameRoot string) ([]Match, error) {
-	matches := make([]Match, 0, initialMatchCapacity)
-
-	err := walkLinuxProcDirs(ctx, func(pid, pidDirFD int) (bool, error) {
-		processMatches, err := matchLinuxProcessAt(pid, pidDirFD, queries, opt, sameRoot)
-		if err == nil && len(processMatches) > 0 {
-			matches = append(matches, processMatches...)
-
-			return opt.Single, nil
-		}
-
-		return false, nil
-	})
+	procRootFD, err := openProcRoot()
 	if err != nil {
 		return nil, fmt.Errorf("scan /proc: %w", err)
+	}
+	defer closeFD(procRootFD)
+
+	matches := make([]Match, 0, initialMatchCapacity)
+
+	walkErr := walkLinuxPIDs(ctx, procRootFD, func(pid int) bool {
+		processMatches := matchLinuxProcessAt(procRootFD, pid, queries, opt, sameRoot)
+		if len(processMatches) == 0 {
+			return true
+		}
+
+		matches = append(matches, processMatches...)
+
+		return !opt.Single
+	})
+	if walkErr != nil {
+		return nil, fmt.Errorf("scan /proc: %w", walkErr)
 	}
 
 	return matches, nil
@@ -141,9 +259,9 @@ func findLinuxSequential(ctx context.Context, queries []query, opt FindOptions, 
 // findLinuxParallel overlaps per-PID /proc reads with a small worker pool while
 // restoring procfs encounter order after the parallel scan completes.
 func findLinuxParallel(ctx context.Context, queries []query, opt FindOptions, sameRoot string) ([]Match, error) {
-	procRootFD, err := unix.Open("/proc", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	procRootFD, err := openProcRoot()
 	if err != nil {
-		return nil, fmt.Errorf("open /proc: %w", err)
+		return nil, fmt.Errorf("scan /proc: %w", err)
 	}
 	defer closeFD(procRootFD)
 
@@ -155,8 +273,8 @@ func findLinuxParallel(ctx context.Context, queries []query, opt FindOptions, sa
 	for range workerCount {
 		workers.Go(func() {
 			for job := range jobs {
-				processMatches, err := matchLinuxProcess(procRootFD, job.pid, queries, opt, sameRoot)
-				if err != nil || len(processMatches) == 0 {
+				processMatches := matchLinuxProcessAt(procRootFD, job.pid, queries, opt, sameRoot)
+				if len(processMatches) == 0 {
 					continue
 				}
 
@@ -168,14 +286,17 @@ func findLinuxParallel(ctx context.Context, queries []query, opt FindOptions, sa
 		})
 	}
 
-	orderedChunks := make(map[int][]Match, initialMatchCapacity)
+	var collected []linuxMatchChunk
 
-	var collectors sync.WaitGroup
-	collectors.Go(func() {
+	collectorDone := make(chan struct{})
+
+	go func() {
 		for chunk := range results {
-			orderedChunks[chunk.order] = chunk.matches
+			collected = append(collected, chunk)
 		}
-	})
+
+		close(collectorDone)
+	}()
 
 	stoppedByContext := false
 	jobCount := 0
@@ -200,7 +321,7 @@ func findLinuxParallel(ctx context.Context, queries []query, opt FindOptions, sa
 	close(jobs)
 	workers.Wait()
 	close(results)
-	collectors.Wait()
+	<-collectorDone
 
 	if produceErr == nil && stoppedByContext {
 		produceErr = ctx.Err()
@@ -210,246 +331,191 @@ func findLinuxParallel(ctx context.Context, queries []query, opt FindOptions, sa
 		return nil, fmt.Errorf("scan /proc: %w", produceErr)
 	}
 
-	matches := make([]Match, 0, initialMatchCapacity)
-	for order := range jobCount {
-		matches = append(matches, orderedChunks[order]...)
+	slices.SortFunc(collected, func(a, b linuxMatchChunk) int {
+		return cmp.Compare(a.order, b.order)
+	})
+
+	totalMatches := 0
+	for _, chunk := range collected {
+		totalMatches += len(chunk.matches)
+	}
+
+	if totalMatches == 0 {
+		return nil, nil
+	}
+
+	matches := make([]Match, 0, totalMatches)
+	for _, chunk := range collected {
+		matches = append(matches, chunk.matches...)
 	}
 
 	return matches, nil
 }
 
-// matchLinuxProcess opens /proc/<pid> and delegates to the per-directory matcher.
-func matchLinuxProcess(procRootFD, pid int, queries []query, opt FindOptions, sameRoot string) ([]Match, error) {
-	var pidText [linuxPIDTextSize]byte
-
-	pidDirFD, err := unix.Openat(
-		procRootFD,
-		bytesToString(strconv.AppendInt(pidText[:0], int64(pid), linuxDecimalBase)),
-		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC,
-		0,
-	)
+// openProcRoot opens /proc as a read-anchored directory descriptor. The same
+// fd is reused for getdents64 to enumerate <pid> entries and as the dirfd
+// anchor for every per-PID openat/readlinkat call, so we never re-resolve
+// "/proc" inside the hot loop. We cannot use O_PATH here: O_PATH descriptors
+// fail getdents64 with EBADF.
+func openProcRoot() (int, error) {
+	fd, err := unix.Open("/proc", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, fmt.Errorf("open /proc/%d: %w", pid, err)
+		return 0, fmt.Errorf("open /proc: %w", err)
 	}
-	defer closeFD(pidDirFD)
 
-	return matchLinuxProcessAt(pid, pidDirFD, queries, opt, sameRoot)
+	return fd, nil
 }
 
-// matchLinuxProcessAt matches one already-open /proc/<pid> directory.
-func matchLinuxProcessAt(pid, pidDirFD int, queries []query, opt FindOptions, sameRoot string) ([]Match, error) {
+// matchLinuxProcessAt resolves all queries against /proc/<pid> using path-based
+// openat/readlinkat off procRootFD. There is intentionally no per-PID directory
+// open: the kernel performs the same path resolution either way, and skipping
+// the extra openat+close pair saves two syscalls per scanned PID. The stat
+// buffer is allocated here (on the stack) so the comm byte slice we get back
+// stays valid for the entire query loop, deferring the string materialisation
+// to the first query that actually matches.
+func matchLinuxProcessAt(procRootFD, pid int, queries []query, opt FindOptions, sameRoot string) []Match {
 	if shouldOmit(pid, opt.Omit) {
-		return nil, nil
+		return nil
 	}
 
-	name, state, ppid, ok := readLinuxStatAt(pidDirFD)
+	var statBuf [linuxStatBufferSize]byte
+
+	commBytes, state, ok := readLinuxStat(procRootFD, pid, statBuf[:])
 	if !ok {
-		return nil, errors.New("parse stat")
+		return nil
 	}
 
 	if state == 'D' && !opt.IncludeDState {
-		return nil, nil
+		return nil
 	}
 
 	if state == 'Z' && !opt.IncludeZombie {
-		return nil, nil
+		return nil
 	}
 
-	if sameRoot != "" {
-		root, _ := readlinkAt(pidDirFD, "root")
-		if root != sameRoot {
-			return nil, nil
-		}
+	if sameRoot != "" && procReadlink(procRootFD, pid, procSuffixRoot) != sameRoot {
+		return nil
 	}
 
-	process := processInfo{
-		PID:   pid,
-		PPID:  ppid,
-		State: state,
-		Name:  name,
+	proc := lazyProc{
+		procRootFD: procRootFD,
+		pid:        pid,
 	}
 
-	var (
-		// exe and cmdline reads are relatively expensive, so keep them lazy and shared across all query checks for this pid.
-		exe       string
-		exeLoaded bool
-	)
+	// copyLen is bounded by linuxCommMaxLen (16), which fits uint8 trivially.
+	copyLen := min(len(commBytes), linuxCommMaxLen)
+	proc.nameLen = uint8(copy(proc.nameBytes[:], commBytes[:copyLen])) //nolint:gosec // bounded above by linuxCommMaxLen=16.
 
-	loadExe := func() string {
-		if exeLoaded {
-			return exe
-		}
-
-		exeLoaded = true
-		exe, _ = readlinkAt(pidDirFD, "exe")
-
-		return exe
-	}
-
-	var (
-		cmd       cmdlineInfo
-		cmdLoaded bool
-	)
-
-	cmdMode := cmdlineArgv0Only
 	if opt.ScriptsToo {
-		cmdMode = cmdlineWithScript
+		proc.cmdMode = cmdlineWithScript
 	}
 
-	loadCmd := func() cmdlineInfo {
-		if cmdLoaded {
-			return cmd
-		}
+	// matches stays nil until the first query actually matches, so the
+	// overwhelming majority of scanned PIDs incur zero match-slice allocations.
+	var matches []Match
 
-		cmdLoaded = true
-		cmd, _ = readCmdlineInfoAt(pidDirFD, cmdMode)
-
-		return cmd
-	}
-
-	matches := make([]Match, 0, linuxPerProcessMatchCap)
-
-	for _, query := range queries {
-		matched, name := linuxMatch(process, query, opt, loadExe, loadCmd)
+	for _, q := range queries {
+		matched, displayName := linuxMatch(&proc, q, opt)
 		if !matched {
 			continue
 		}
 
+		if matches == nil {
+			matches = make([]Match, 0, linuxPerProcessMatchCap)
+		}
+
 		matches = append(matches, Match{
-			Query: query.raw,
+			Query: q.raw,
 			PID:   pid,
-			Name:  name,
+			Name:  displayName,
 		})
 	}
 
-	return matches, nil
+	return matches
 }
 
-// linuxMatch checks the cheap process name first and only loads exe/cmdline when
-// a query needs more detail.
-func linuxMatch(process processInfo, query query, opt FindOptions, loadExe func() string, loadCmd func() cmdlineInfo) (bool, string) {
+// linuxMatch checks the cheap process name first and only loads exe/cmdline
+// when a query needs more detail.
+func linuxMatch(proc *lazyProc, q query, opt FindOptions) (bool, string) {
 	mode := shortDisplay
 	if opt.LongNames {
 		mode = longDisplay
 	}
 
-	if !query.fullPath && process.Name == query.base {
+	if !q.fullPath && proc.NameEquals(q.base) {
 		if !opt.LongNames {
-			return true, process.Name
+			return true, proc.Name()
 		}
 
-		return true, linuxDisplayName(process, loadExe(), cmdlineInfo{}, mode, regularMatch)
+		return true, linuxDisplayName(proc, cmdlineInfo{}, mode, regularMatch)
 	}
 
-	exe := loadExe()
-	if query.fullPath {
-		if samePath(exe, query.raw) {
-			return true, linuxDisplayName(process, exe, cmdlineInfo{}, mode, regularMatch)
+	exe := proc.Exe()
+	if q.fullPath {
+		if samePath(exe, q.raw) {
+			return true, linuxDisplayName(proc, cmdlineInfo{}, mode, regularMatch)
 		}
 
-		cmd := loadCmd()
+		cmd := proc.Cmd()
 		switch {
-		case samePath(cmd.argv0, query.raw):
-			return true, linuxDisplayName(process, exe, cmd, mode, regularMatch)
-		case opt.ScriptsToo && samePath(cmd.script, query.raw):
-			return true, linuxDisplayName(process, exe, cmd, mode, scriptMatch)
+		case samePath(cmd.argv0, q.raw):
+			return true, linuxDisplayName(proc, cmd, mode, regularMatch)
+		case opt.ScriptsToo && samePath(cmd.script, q.raw):
+			return true, linuxDisplayName(proc, cmd, mode, scriptMatch)
 		default:
 			return false, ""
 		}
 	}
 
-	if baseName(exe) == query.base {
-		return true, linuxDisplayName(process, exe, cmdlineInfo{}, mode, regularMatch)
+	if proc.ExeBase() == q.base {
+		return true, linuxDisplayName(proc, cmdlineInfo{}, mode, regularMatch)
 	}
 
-	cmd := cmdlineInfo{}
+	var cmd cmdlineInfo
 	if exe == "" || opt.ScriptsToo {
-		cmd = loadCmd()
-		if baseName(cmd.argv0) == query.base {
-			return true, linuxDisplayName(process, exe, cmd, mode, regularMatch)
+		cmd = proc.Cmd()
+		if cmd.argv0Base == q.base {
+			return true, linuxDisplayName(proc, cmd, mode, regularMatch)
 		}
 	}
 
-	if opt.ScriptsToo && baseName(cmd.script) == query.base {
-		return true, linuxDisplayName(process, exe, cmd, mode, scriptMatch)
+	if opt.ScriptsToo && cmd.scriptBase == q.base {
+		return true, linuxDisplayName(proc, cmd, mode, scriptMatch)
 	}
 
 	return false, ""
 }
 
-// linuxDisplayName chooses the most informative printable name with the data that
-// has already been loaded for the current query.
-func linuxDisplayName(process processInfo, exe string, cmd cmdlineInfo, mode displayMode, kind matchKind) string {
-	if kind == scriptMatch {
-		if script := baseName(cmd.script); script != "" {
-			return script
-		}
+// linuxDisplayName chooses the most informative printable name with the data
+// that has already been loaded for the current query.
+func linuxDisplayName(proc *lazyProc, cmd cmdlineInfo, mode displayMode, kind matchKind) string {
+	if kind == scriptMatch && cmd.scriptBase != "" {
+		return cmd.scriptBase
 	}
 
 	if mode == longDisplay {
-		if exec := baseName(exe); exec != "" {
+		if exec := proc.ExeBase(); exec != "" {
 			return exec
 		}
 
-		if argv0 := baseName(cmd.argv0); argv0 != "" {
-			return argv0
+		if cmd.argv0Base != "" {
+			return cmd.argv0Base
 		}
 	}
 
-	if name := baseName(process.Name); name != "" {
+	if name := proc.NameBase(); name != "" {
 		return name
 	}
 
-	if exec := baseName(exe); exec != "" {
+	if exec := proc.ExeBase(); exec != "" {
 		return exec
 	}
 
-	return baseName(cmd.argv0)
+	return cmd.argv0Base
 }
 
-// walkLinuxProcDirs sequentially iterates /proc numeric directories and opens
-// each matching process directory for the callback.
-func walkLinuxProcDirs(ctx context.Context, fn func(pid, pidDirFD int) (stop bool, err error)) error {
-	procRootFD, err := unix.Open("/proc", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return fmt.Errorf("open /proc: %w", err)
-	}
-	defer closeFD(procRootFD)
-
-	var callbackErr error
-
-	err = walkLinuxPIDs(ctx, procRootFD, func(pid int) bool {
-		var pidText [linuxPIDTextSize]byte
-
-		pidDirFD, err := unix.Openat(
-			procRootFD,
-			bytesToString(strconv.AppendInt(pidText[:0], int64(pid), linuxDecimalBase)),
-			unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC,
-			0,
-		)
-		if err != nil {
-			return true
-		}
-
-		stop, cbErr := fn(pid, pidDirFD)
-		closeFD(pidDirFD)
-
-		if cbErr != nil {
-			callbackErr = cbErr
-
-			return false
-		}
-
-		return !stop
-	})
-	if err != nil {
-		return fmt.Errorf("walk /proc directories: %w", err)
-	}
-
-	return callbackErr
-}
-
-// walkLinuxPIDs streams numeric /proc entries without allocating per directory name.
+// walkLinuxPIDs streams numeric /proc entries without allocating per directory
+// name.
 func walkLinuxPIDs(ctx context.Context, procRootFD int, yield func(pid int) bool) error {
 	var dirbuf [linuxDirentBufferSize]byte
 
@@ -493,139 +559,152 @@ func walkLinuxPIDs(ctx context.Context, procRootFD int, yield func(pid int) bool
 	}
 }
 
-// readLinuxStatAt parses /proc/<pid>/stat.
-func readLinuxStatAt(pidDirFD int) (name string, state byte, ppid int, ok bool) {
-	var statBuf [linuxStatBufferSize]byte
+// readLinuxStat opens, reads, and parses /proc/<pid>/stat in a single openat
+// against procRootFD. The comm bytes are returned as a slice into statBuf
+// (which must outlive the returned slice); the caller decides whether/when to
+// materialise it as a Go string. Returns ok=false on any error so the caller
+// skips the pid without paying for fmt.Errorf wrapping on the discard path.
+func readLinuxStat(procRootFD, pid int, statBuf []byte) (comm []byte, state byte, ok bool) {
+	var pathBuf [linuxMaxProcPathSize]byte
 
-	n, err := readSmallFileAt(pidDirFD, "stat", statBuf[:])
-	if err != nil || n == 0 {
-		return "", 0, 0, false
+	fd, err := procOpenat(procRootFD, buildProcPath(pathBuf[:0], pid, procSuffixStat))
+	if err != nil {
+		return nil, 0, false
 	}
 
-	return parseProcStat(statBuf[:n])
+	n, err := unix.Read(fd, statBuf)
+	closeFD(fd)
+
+	if err != nil || n <= 0 {
+		return nil, 0, false
+	}
+
+	return parseProcStatFields(statBuf[:n])
 }
 
-// readSmallFileAt reads small procfs files with one open and one read.
-func readSmallFileAt(dirFD int, name string, dst []byte) (int, error) {
-	fd, err := unix.Openat(dirFD, name, unix.O_RDONLY|unix.O_CLOEXEC, 0)
-	if err != nil {
-		return 0, fmt.Errorf("open %s: %w", name, err)
-	}
-	defer closeFD(fd)
+// procReadCmdline reads /proc/<pid>/cmdline and extracts argv[0] and,
+// optionally, the first script-like argument.
+func procReadCmdline(procRootFD, pid int, mode cmdlineReadMode) cmdlineInfo {
+	var pathBuf [linuxMaxProcPathSize]byte
 
-	n, err := unix.Read(fd, dst)
+	fd, err := procOpenat(procRootFD, buildProcPath(pathBuf[:0], pid, procSuffixCmdline))
 	if err != nil {
-		return 0, fmt.Errorf("read %s: %w", name, err)
+		return cmdlineInfo{}
 	}
 
-	return n, nil
-}
-
-// readCmdlineInfoAt reads argv0 and, optionally, the first script-like argument.
-func readCmdlineInfoAt(dirFD int, mode cmdlineReadMode) (cmdlineInfo, error) {
 	var buf [linuxCmdlineBufferSize]byte
 
-	n, err := readSmallFileAt(dirFD, "cmdline", buf[:])
-	if err != nil {
-		return cmdlineInfo{}, fmt.Errorf("read cmdline: %w", err)
-	}
+	n, err := unix.Read(fd, buf[:])
+	closeFD(fd)
 
-	if n == 0 {
-		return cmdlineInfo{}, errors.New("read cmdline: empty file")
+	if err != nil || n <= 0 {
+		return cmdlineInfo{}
 	}
 
 	field, rest, ok := nextNULField(buf[:n])
 	if !ok {
-		return cmdlineInfo{}, nil
+		return cmdlineInfo{}
 	}
 
-	cmd := cmdlineInfo{
-		argv0: string(field),
-	}
+	cmd := cmdlineInfo{argv0: string(field)}
+	cmd.argv0Base = baseName(cmd.argv0)
 
 	if mode == cmdlineArgv0Only {
-		return cmd, nil
+		return cmd
 	}
 
-	cmd.script = firstScriptArg(cmd.argv0, rest)
+	cmd.script = firstScriptArgN(cmd.argv0Base, rest, -1)
+	cmd.scriptBase = baseName(cmd.script)
 
-	return cmd, nil
+	return cmd
 }
 
-// readlinkAt reads a procfs symlink into a stack-backed buffer.
-func readlinkAt(dirFD int, name string) (string, error) {
-	var buf [linuxReadlinkBufferSize]byte
+// procReadlink reads the procfs symlink /proc/<pid>/<suffix> with a
+// stack-backed scratch buffer. Errors collapse to an empty string because the
+// caller never distinguishes failure modes.
+func procReadlink(procRootFD, pid int, suffix string) string {
+	var (
+		pathBuf [linuxMaxProcPathSize]byte
+		readBuf [linuxReadlinkBufferSize]byte
+	)
 
-	n, err := unix.Readlinkat(dirFD, name, buf[:])
-	if err != nil {
-		return "", fmt.Errorf("readlink %s: %w", name, err)
+	n, err := procReadlinkat(procRootFD, buildProcPath(pathBuf[:0], pid, suffix), readBuf[:])
+	if err != nil || n <= 0 {
+		return ""
 	}
 
-	if n <= 0 {
-		return "", fmt.Errorf("readlink %s: empty target", name)
-	}
-
-	return string(buf[:n]), nil
+	return string(readBuf[:n])
 }
 
-// parseProcStat extracts comm, state, and ppid from /proc/<pid>/stat.
-func parseProcStat(b []byte) (name string, state byte, ppid int, ok bool) {
+// buildProcPath writes "<pid>" followed by suffix (which must already include a
+// trailing NUL) into buf and returns the resulting slice. The returned slice is
+// safe to pass to procOpenat/procReadlinkat.
+func buildProcPath(buf []byte, pid int, suffix string) []byte {
+	out := strconv.AppendInt(buf[:0], int64(pid), linuxDecimalBase)
+
+	return append(out, suffix...)
+}
+
+// procOpenat is openat(dirfd, path, O_RDONLY|O_CLOEXEC) using a raw Syscall6
+// against an already NUL-terminated path. This skips the BytePtrFromString
+// alloc that unix.Openat performs (one ~16-byte slice per call), which adds up
+// to two skipped allocs per matched PID. The path is a stack-allocated,
+// NUL-terminated buffer that the kernel reads synchronously; int<->uintptr
+// widths match on every supported arch.
+//
+//nolint:gosec // raw syscall by design; see comment above.
+func procOpenat(dirfd int, path []byte) (int, error) {
+	r1, _, errno := unix.Syscall6(
+		unix.SYS_OPENAT,
+		uintptr(dirfd),
+		uintptr(unsafe.Pointer(&path[0])),
+		uintptr(unix.O_RDONLY|unix.O_CLOEXEC),
+		0,
+		0,
+		0,
+	)
+	if errno != 0 {
+		return 0, errno
+	}
+
+	return int(r1), nil
+}
+
+// procReadlinkat is readlinkat(dirfd, path, buf) via raw Syscall6 with a
+// pre-NUL-terminated path. path and buf are stack-allocated; the syscall is
+// synchronous so the Go runtime keeps both alive; int<->uintptr widths match
+// on amd64/arm64. See procOpenat for the broader rationale.
+//
+//nolint:gosec // raw syscall by design; see comment above.
+func procReadlinkat(dirfd int, path, buf []byte) (int, error) {
+	r1, _, errno := unix.Syscall6(
+		unix.SYS_READLINKAT,
+		uintptr(dirfd),
+		uintptr(unsafe.Pointer(&path[0])),
+		uintptr(unsafe.Pointer(&buf[0])),
+		uintptr(len(buf)),
+		0,
+		0,
+	)
+	if errno != 0 {
+		return 0, errno
+	}
+
+	return int(r1), nil
+}
+
+// parseProcStatFields parses /proc/<pid>/stat into comm (as a slice of the
+// input buffer) and state. It deliberately returns the comm slice without
+// allocating; the caller materialises a string only when it intends to keep it.
+func parseProcStatFields(b []byte) (comm []byte, state byte, ok bool) {
 	open := bytes.IndexByte(b, '(')
 
 	closeParen := bytes.LastIndexByte(b, ')')
-	if open < 0 || closeParen <= open || closeParen+4 > len(b) {
-		return "", 0, 0, false
+	if open < 0 || closeParen <= open || closeParen+procStatStateOffset >= len(b) {
+		return nil, 0, false
 	}
 
-	name = string(b[open+1 : closeParen])
-
-	stateIndex := closeParen + procStatStateOffset
-	if stateIndex >= len(b) {
-		return "", 0, 0, false
-	}
-
-	state = b[stateIndex]
-
-	ppidStart := stateIndex + procStatPPIDOffset
-	if ppidStart >= len(b) {
-		return "", 0, 0, false
-	}
-
-	ppid, ok = parseInt(b[ppidStart:])
-
-	return name, state, ppid, ok
-}
-
-// parseInt parses the leading decimal integer from b.
-func parseInt(b []byte) (int, bool) {
-	if len(b) == 0 {
-		return 0, false
-	}
-
-	sign := 1
-	i := 0
-
-	if b[0] == '-' {
-		sign = -1
-		i++
-	}
-
-	if i >= len(b) || b[i] < '0' || b[i] > '9' {
-		return 0, false
-	}
-
-	n := 0
-
-	for ; i < len(b); i++ {
-		c := b[i]
-		if c < '0' || c > '9' {
-			break
-		}
-
-		n = n*linuxDecimalBase + int(c-'0')
-	}
-
-	return sign * n, true
+	return b[open+1 : closeParen], b[closeParen+procStatStateOffset], true
 }
 
 // parseUint parses a decimal pid from a /proc directory name.
@@ -673,14 +752,4 @@ func nextLinuxDirent(buf []byte, off *int) (typ uint8, name []byte, ok bool) {
 // closeFD closes a procfs descriptor on a best-effort basis.
 func closeFD(fd int) {
 	_ = unix.Close(fd)
-}
-
-// bytesToString converts a short-lived byte slice to string without allocation.
-func bytesToString(b []byte) string {
-	if len(b) == 0 {
-		return ""
-	}
-
-	//nolint:gosec // The string is used immediately for procfs path lookup and never outlives b.
-	return unsafe.String(&b[0], len(b))
 }

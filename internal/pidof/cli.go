@@ -43,9 +43,8 @@ const usageText = `usage: pidof [-k] [-l] [-h|-?] [-v] [-s] [-c] [-x] [-q] [-z] 
 
 type killFunc func(int) error
 
-// cliOptions keeps the parsed flag state together so Main can stay straight-line
-// without dragging a long var list around. The bools live at the end to keep
-// the layout tight on 64-bit targets.
+// cliOptions keeps the parsed flag state together so Main can stay straight
+// line without dragging a long var list around.
 type cliOptions struct {
 	separator            string
 	queries              []string
@@ -100,7 +99,8 @@ func loadRunOptions(args []string) (cliOptions, int, bool) {
 
 		return cliOptions{}, exitSuccess, false
 	case opts.showVersion:
-		_, _ = io.WriteString(os.Stdout, versionString()+"\n")
+		_, _ = io.WriteString(os.Stdout, versionString())
+		_, _ = io.WriteString(os.Stdout, "\n")
 
 		return cliOptions{}, exitSuccess, false
 	case len(opts.queries) == 0:

@@ -12,23 +12,21 @@ import (
 	"time"
 )
 
-func Test_parseProcStat(t *testing.T) {
+func Test_parseProcStatFields(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
 		name      string
 		input     []byte
-		wantName  string
+		wantComm  string
 		wantState byte
-		wantPPID  int
 		wantOK    bool
 	}{
 		{
 			name:      "valid stat line",
 			input:     []byte("1234 (python3.12) S 44 1 1 0 -1 4194560 0 0 0 0 0 0 0 0 20 0 1 0 123 456"),
-			wantName:  "python3.12",
+			wantComm:  "python3.12",
 			wantState: 'S',
-			wantPPID:  44,
 			wantOK:    true,
 		},
 		{
@@ -42,51 +40,75 @@ func Test_parseProcStat(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			name, state, ppid, ok := parseProcStat(test.input)
+			comm, state, ok := parseProcStatFields(test.input)
 			if ok != test.wantOK {
 				t.Fatalf("ok = %v, want %v", ok, test.wantOK)
 			}
 
-			if name != test.wantName {
-				t.Fatalf("name = %q, want %q", name, test.wantName)
+			if string(comm) != test.wantComm {
+				t.Fatalf("comm = %q, want %q", comm, test.wantComm)
 			}
 
 			if state != test.wantState {
 				t.Fatalf("state = %q, want %q", state, test.wantState)
 			}
-
-			if ppid != test.wantPPID {
-				t.Fatalf("ppid = %d, want %d", ppid, test.wantPPID)
-			}
 		})
 	}
+}
+
+// newPreloadedLazyProc builds a *lazyProc with its lazy loaders short-circuited
+// so tests run without touching procfs. cmd basenames are derived from the
+// raw fields to mirror what procReadCmdline produces in production.
+func newPreloadedLazyProc(name, exe string, cmd cmdlineInfo) *lazyProc {
+	if cmd.argv0Base == "" {
+		cmd.argv0Base = baseName(cmd.argv0)
+	}
+
+	if cmd.scriptBase == "" {
+		cmd.scriptBase = baseName(cmd.script)
+	}
+
+	proc := &lazyProc{
+		name:           name,
+		nameBase:       baseName(name),
+		exe:            exe,
+		exeBase:        baseName(exe),
+		cmd:            cmd,
+		nameLoaded:     true,
+		nameBaseLoaded: true,
+		exeLoaded:      true,
+		cmdLoaded:      true,
+	}
+
+	copyLen := min(len(name), linuxCommMaxLen)
+	proc.nameLen = uint8(copy(proc.nameBytes[:], name[:copyLen])) //nolint:gosec // bounded above by linuxCommMaxLen=16.
+
+	return proc
 }
 
 func Test_linuxDisplayName(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		process processInfo
-		exe     string
-		cmd     cmdlineInfo
-		mode    displayMode
-		kind    matchKind
-		want    string
+		name string
+		proc *lazyProc
+		cmd  cmdlineInfo
+		mode displayMode
+		kind matchKind
+		want string
 	}{
 		{
-			name:    "prefers script when it matched",
-			process: processInfo{Name: "python3"},
-			exe:     "/usr/bin/python3",
-			cmd:     cmdlineInfo{argv0: "/usr/bin/python3", script: "/tmp/tool.py"},
-			mode:    longDisplay,
-			kind:    scriptMatch,
-			want:    "tool.py",
+			name: "prefers script when it matched",
+			proc: newPreloadedLazyProc("python3", "/usr/bin/python3", cmdlineInfo{argv0: "/usr/bin/python3", script: "/tmp/tool.py"}),
+			cmd:  cmdlineInfo{argv0: "/usr/bin/python3", argv0Base: "python3", script: "/tmp/tool.py", scriptBase: "tool.py"},
+			mode: longDisplay,
+			kind: scriptMatch,
+			want: "tool.py",
 		},
 		{
-			name:    "falls back to process name",
-			process: processInfo{Name: "bash"},
-			want:    "bash",
+			name: "falls back to process name",
+			proc: newPreloadedLazyProc("bash", "", cmdlineInfo{}),
+			want: "bash",
 		},
 	}
 
@@ -94,7 +116,7 @@ func Test_linuxDisplayName(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := linuxDisplayName(test.process, test.exe, test.cmd, test.mode, test.kind)
+			got := linuxDisplayName(test.proc, test.cmd, test.mode, test.kind)
 			if got != test.want {
 				t.Fatalf("linuxDisplayName() = %q, want %q", got, test.want)
 			}
@@ -107,37 +129,31 @@ func Test_linuxMatch(t *testing.T) {
 
 	tests := []struct {
 		name        string
-		process     processInfo
+		proc        *lazyProc
 		query       query
 		opt         FindOptions
-		exe         string
-		cmd         cmdlineInfo
 		wantMatched bool
 		wantName    string
 	}{
 		{
 			name:        "script match",
-			process:     processInfo{Name: "python3"},
+			proc:        newPreloadedLazyProc("python3", "/usr/bin/python3", cmdlineInfo{argv0: "/usr/bin/python3", script: "/tmp/tool.py"}),
 			query:       query{raw: "tool.py", base: "tool.py"},
 			opt:         FindOptions{ScriptsToo: true},
-			exe:         "/usr/bin/python3",
-			cmd:         cmdlineInfo{argv0: "/usr/bin/python3", script: "/tmp/tool.py"},
 			wantMatched: true,
 			wantName:    "tool.py",
 		},
 		{
 			name:        "plain process name fast path",
-			process:     processInfo{Name: "bash"},
+			proc:        newPreloadedLazyProc("bash", "", cmdlineInfo{}),
 			query:       query{raw: "bash", base: "bash"},
 			wantMatched: true,
 			wantName:    "bash",
 		},
 		{
 			name:        "matches interpreter executable exactly",
-			process:     processInfo{Name: "bashlike.sh"},
+			proc:        newPreloadedLazyProc("bashlike.sh", "/bin/bash", cmdlineInfo{argv0: "/tmp/bashlike.sh"}),
 			query:       query{raw: "bash", base: "bash"},
-			exe:         "/bin/bash",
-			cmd:         cmdlineInfo{argv0: "/tmp/bashlike.sh"},
 			wantMatched: true,
 			wantName:    "bashlike.sh",
 		},
@@ -147,13 +163,7 @@ func Test_linuxMatch(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			t.Parallel()
 
-			matched, name := linuxMatch(
-				test.process,
-				test.query,
-				test.opt,
-				func() string { return test.exe },
-				func() cmdlineInfo { return test.cmd },
-			)
+			matched, name := linuxMatch(test.proc, test.query, test.opt)
 			if matched != test.wantMatched {
 				t.Fatalf("matched = %v, want %v", matched, test.wantMatched)
 			}
